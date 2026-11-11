@@ -164,7 +164,6 @@ def test_select_by_pointing_and_by_sequence(live_server):
         page.evaluate("() => window.vrPymolDebug.onGrabEnd(0)")
 
         # --- a different molecule drops the selection and its sequence ---
-        page.uncheck("#rep-checkboxes input[value='cartoon']")
         page.select_option("#molecule-select", "caffeine")
         page.wait_for_function(
             "() => window.vrPymolDebug.sequence.join('') === 'X'", timeout=10000

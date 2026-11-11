@@ -13,6 +13,7 @@ from pymol import util
 
 from pymol_bridge.mesh_export import export_wrl
 from pymol_bridge.session import PymolSession
+from vr_pymol.glb_pack import has_geometry
 from vr_pymol.gltf_export import export_gltf
 from vr_pymol.mesh_loader import load_actors
 from webxr.dev_cert import ensure_dev_cert
@@ -22,6 +23,20 @@ STATIC_DIR = os.path.join(HERE, "static")
 SCENE_DIR = os.path.join(HERE, "_scene")
 FIXTURES_DIR = os.path.join(os.path.dirname(HERE), "tests", "fixtures")
 GLTF_PATH = os.path.join(SCENE_DIR, "scene.gltf")
+
+# Representations the frontend can ask for one at a time (`/api/layer`).
+LAYER_REPS = (
+    "cartoon",
+    "sticks",
+    "spheres",
+    "lines",
+    "ribbon",
+    "nonbonded",
+    "nb_spheres",
+    "surface",
+    "mesh",
+    "dots",
+)
 
 DEFAULT_MOLECULE = "1crn"
 DEFAULT_REP = "cartoon"
@@ -124,6 +139,7 @@ def rebuild_scene(
     cartoon_flat_sheets=True,
     cartoon_smooth_loops=False,
     frame=1,
+    export=True,
 ):
     """Replace the *entire* scene with just `molecule` (single-object mode,
     the original behavior, object always named "mol") and show `rep` (one or
@@ -143,6 +159,10 @@ def rebuild_scene(
     off. `frame` (real PyMOL movie frame) only matters for multi-state
     molecules (e.g. NMR ensembles); harmless default of 1 for every
     single-state fixture.
+
+    `export=False` loads the molecule and records the settings without
+    exporting anything, for callers that fetch representations one at a time
+    through `/api/layer` (every export applies the recorded settings itself).
 
     To add/remove more objects *alongside* this one without resetting the
     whole scene, use `add_object_to_scene`/`remove_object_from_scene`.
@@ -170,7 +190,8 @@ def rebuild_scene(
         _objects.clear()
         _objects["mol"] = molecule
         _display_settings.update(settings)
-        _export_current_scene(session, _display_settings)
+        if export:
+            _export_current_scene(session, _display_settings)
 
 
 def add_object_to_scene(molecule):
@@ -251,6 +272,9 @@ def api_scene():
         request.args.get("cartoon_smooth_loops", "1" if _display_settings["cartoon_smooth_loops"] else "0") != "0"
     )
     frame = request.args.get("frame", type=int, default=_display_settings["frame"])
+    # export=0: the layered frontend only wants the session updated here and
+    # fetches each representation separately from /api/layer.
+    export = request.args.get("export", "1") != "0"
 
     try:
         if molecule is not None and _objects.get("mol") != molecule:
@@ -265,6 +289,7 @@ def api_scene():
                 cartoon_flat_sheets=cartoon_flat_sheets,
                 cartoon_smooth_loops=cartoon_smooth_loops,
                 frame=frame,
+                export=export,
             )
         else:
             if color not in _COLOR_SCHEMES:
@@ -283,7 +308,8 @@ def api_scene():
             with _lock:
                 session = _get_session()
                 _display_settings.update(settings)
-                _export_current_scene(session, _display_settings)
+                if export:
+                    _export_current_scene(session, _display_settings)
     except FileNotFoundError:
         return jsonify({"ok": False, "error": f"unknown molecule {molecule!r}"}), 404
     except ValueError as e:
@@ -309,6 +335,31 @@ def api_scene():
             "max_states": max_states,
         }
     )
+
+
+@app.route("/api/layer")
+def api_layer():
+    """One representation of the current scene, as glTF.
+
+    The frontend draws each representation as its own layer and decides per
+    residue which part of it is visible, so it asks for them one at a time,
+    under the current colouring and display settings. 404 when PyMOL draws
+    nothing for this representation (cartoon of a small molecule, nonbonded
+    of a structure with no waters or ions).
+    """
+    rep = request.args.get("rep")
+    if rep not in LAYER_REPS:
+        return jsonify({"ok": False, "error": f"unknown representation {rep!r}"}), 400
+    with _lock:
+        session = _get_session()
+        _export_current_scene(session, {**_display_settings, "rep": rep})
+        if not has_geometry(GLTF_PATH):
+            return jsonify({"ok": False, "error": f"nothing to draw as {rep}"}), 404
+        with open(GLTF_PATH, "rb") as f:
+            data = f.read()
+    response = Response(data, mimetype="model/gltf+json")
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.route("/api/objects", methods=["GET"])

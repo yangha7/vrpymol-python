@@ -46,9 +46,12 @@ def test_rapid_checkbox_toggling_coalesces_into_one_request(live_server):
             }"""
         )
 
-        # Rapidly check several boxes back to back, like a user clicking
-        # through "select all" -- no waiting for each to settle.
-        for value in ["sticks", "spheres", "lines", "nonbonded", "nb_spheres"]:
+        # Check several boxes back to back, like a user clicking through
+        # "select all". Each representation is now its own layer, fetched
+        # once from /api/layer, so toggling them must not touch /api/scene
+        # (which reloads the whole scene) at all.
+        reps = ["sticks", "spheres", "lines", "ribbon", "surface"]
+        for value in reps:
             page.check(f"#rep-checkboxes input[value='{value}']")
 
         page.wait_for_function(
@@ -57,13 +60,17 @@ def test_rapid_checkbox_toggling_coalesces_into_one_request(live_server):
         )
 
         request_count = page.evaluate("() => window.__sceneRequestCount")
-        # 5 rapid toggles should coalesce into (usually) exactly 1 request --
-        # allow a little slack for scheduling jitter, but this must be far
-        # fewer than 5 (one per click, the bug this guards against).
-        assert request_count <= 2, (
-            f"expected rapid toggling to coalesce into ~1 request, got {request_count} "
-            f"-- debounce/coalescing regression"
+        assert request_count == 0, (
+            f"representation toggles made {request_count} /api/scene requests"
         )
+        page.wait_for_function(
+            f"() => {reps!r}.every((rep) => window.vrPymolDebug.layerState(rep) === 'ready')",
+            timeout=15000,
+        )
+        for value in reps:
+            assert page.is_checked(f"#rep-checkboxes input[value='{value}']")
+            triangles = page.evaluate(f"() => window.vrPymolDebug.layerTriangles('{value}')")
+            assert triangles["visible"] == triangles["total"] > 0, (value, triangles)
 
         browser.close()
 
@@ -121,10 +128,9 @@ def test_controls_disabled_while_a_request_is_in_flight(live_server):
         assert not page.eval_on_selector("#molecule-select", "el => el.disabled")
 
         page.check("#rep-checkboxes input[value='surface']")
-        # right after the debounced request actually fires, controls should
-        # be disabled -- give the debounce (300ms) a moment to fire, then
-        # check before the (comparatively slow) surface render can finish.
-        page.wait_for_timeout(400)
+        # the layer request goes out at once, so controls are disabled
+        # straight away, before the (comparatively slow) surface export
+        # can finish.
         assert page.eval_on_selector("#molecule-select", "el => el.disabled"), (
             "expected controls to be disabled while a scene request is in flight"
         )

@@ -18,7 +18,7 @@ PyMOL's own OBJ/COLLADA export bakes spheres/cartoons into degenerate or bulky m
 
 ## Features
 
-- **Representations**: cartoon, sticks, spheres, lines, ribbon, nonbonded, nb_spheres, surface, mesh, dots — combinable like real PyMOL (not single-select).
+- **Representations**: cartoon, sticks, spheres, lines, ribbon, nonbonded, nb_spheres, surface, mesh, dots — combinable like real PyMOL, and **per selection**: show sticks for the residues you selected while the rest stays cartoon, hide part of the cartoon, and so on. Each representation is loaded as its own layer and the browser draws only the selected residues' part of it, so mixing is instant and needs no re-export (cut ends of a cartoon or surface are therefore slightly ragged, not PyMOL's own end caps).
 - **Coloring**: default CPK, by chain, rainbow (N→C), by secondary structure, by B-factor — all real PyMOL commands (`util.cbc`, `util.chainbow`, `util.cbss`, `cmd.spectrum`).
 - **Cartoon detail**: flat/smooth sheets, smooth loops (real `cartoon_*` settings).
 - **Size controls**: stick radius, sphere scale (real `cmd.set` settings).
@@ -27,7 +27,7 @@ PyMOL's own OBJ/COLLADA export bakes spheres/cartoons into degenerate or bulky m
 - **Multiple objects at once**: load several molecules into the same scene via the "additional objects" panel — auto-arranged so they don't overlap.
 - **Multiple states / movie frames**: a real `cmd.frame` slider appears for multi-state molecules (e.g. NMR ensembles — try `1le0`, a real 20-model structure).
 - **Residue selection**: point at the molecule to select a residue, or pick residues (click one, sweep for a range) in a sequence window. Selected atoms get pink markers and the selection is shown as a PyMOL expression (`chain A and resi 6-18`). Works in the static build too.
-- **VR controls**: **trigger** selects (a residue on the molecule, or a letter on the sequence window), **grip** grabs — one hand to move/rotate, both hands to scale and rotate — **thumbstick** forward/back zooms, **A/B** (X/Y on the left hand) shows or hides the sequence window, which floats below the molecule.
+- **VR controls**: **trigger** selects (a residue on the molecule, or a letter on the sequence window), **grip** grabs — one hand to move/rotate, both hands to scale and rotate — **thumbstick** forward/back zooms, **A/B** (X/Y on the left hand) shows or hides the menu window, which floats below the molecule and carries show/hide buttons per representation, selection helpers (all / invert / none) and the sequence.
 - **Reset view**, background color picker.
 
 **Known architectural limits** (checked directly against PyMOL's real VRML2 export, not assumed): 2D atom/residue **labels** and per-representation **transparency** never survive this export path — PyMOL's own VRML2 writer doesn't emit them regardless of settings. Everything else in the app is a real, verified PyMOL feature.
@@ -57,7 +57,7 @@ It prints an HTTPS URL (WebXR requires a secure context, so the server terminate
 
 A serverless build is published at **https://anpigzhao-jpg.github.io/vrpymol-python/** — open it in the Meta Quest Browser and tap "Enter VR". Nothing needs to run on your computer.
 
-Since PyMOL can't run inside a browser, the static build is pre-baked: `webxr/bake_static.py` runs the same real-PyMOL export pipeline ahead of time for every molecule × representation × color scheme in a fixed grid, compresses each scene to a quantized `.glb` (`vr_pymol/glb_pack.py`), and writes a per-molecule atom table so click-to-measure still works client-side. The page picks one representation preset at a time; free combination of representations, extra objects, NMR frames and the size/cartoon sliders need the live server above.
+Since PyMOL can't run inside a browser, the static build is pre-baked: `webxr/bake_static.py` runs the same real-PyMOL export pipeline ahead of time for every molecule × representation × color scheme in a fixed grid, compresses each scene to a quantized `.glb` (`vr_pymol/glb_pack.py`), and writes a per-molecule atom table so click-to-measure still works client-side. Six representations are baked (cartoon, sticks, spheres, lines, ribbon, surface) and can be mixed per selection exactly as with the live server; nonbonded, nb_spheres, mesh and dots, extra objects, NMR frames and the size/cartoon sliders need the live server above.
 
 Rebuild and publish:
 

@@ -23,7 +23,11 @@ def _zoom(page, stick_y, dt, frames=1):
     )
 
 
-def _close(a, b, tol=1e-3):
+def _pivot(page):
+    return page.evaluate("() => window.vrPymolDebug.zoomPivot")
+
+
+def _close(a, b, tol=1e-6):
     return all(abs(x - y) < tol for x, y in zip(a, b))
 
 
@@ -47,6 +51,9 @@ def test_thumbstick_zoom(live_server):
         )
 
         start = _get_box_center_and_position(page, MODEL)
+        # The pivot is the centre of the molecule's atoms, which is close to
+        # but not exactly the centre of whatever geometry is drawn.
+        pivot = _pivot(page)
 
         # Inside the deadzone: stick drift must not zoom.
         _zoom(page, -0.1, 0.5)
@@ -56,15 +63,14 @@ def test_thumbstick_zoom(live_server):
         _zoom(page, -1.0, 0.5)
         zoomed_in = _get_box_center_and_position(page, MODEL)
         assert abs(zoomed_in["scale"] / start["scale"] - 2.718281828 ** 0.5) < 1e-3
-        assert _close(zoomed_in["center"], start["center"]), (
-            f"zoom should not move the model: {start} -> {zoomed_in}"
-        )
+        assert _close(_pivot(page), pivot), "zoom should not move the molecule's centre"
+        assert not _close(zoomed_in["position"], start["position"])  # it scaled about it
 
         # Back by the same amount returns to the starting size.
         _zoom(page, 1.0, 0.5)
         restored = _get_box_center_and_position(page, MODEL)
         assert abs(restored["scale"] / start["scale"] - 1) < 1e-6
-        assert _close(restored["center"], start["center"])
+        assert _close(_pivot(page), pivot)
 
         # Held for a long time, zoom stops at the limits instead of running away.
         _zoom(page, -1.0, 0.1, frames=200)
@@ -73,7 +79,7 @@ def test_thumbstick_zoom(live_server):
         _zoom(page, 1.0, 0.1, frames=400)
         smallest = _get_box_center_and_position(page, MODEL)
         assert abs(smallest["scale"] / start["scale"] - 0.05) < 1e-6
-        assert _close(smallest["center"], start["center"])
+        assert _close(_pivot(page), pivot)
 
         # Reset view undoes zoom.
         page.evaluate("() => window.vrPymolResetView()")
@@ -95,12 +101,11 @@ def test_thumbstick_zoom(live_server):
             }"""
         )
         held = _get_box_center_and_position(page, MODEL)
+        held_pivot = _pivot(page)
         _zoom(page, -1.0, 0.5)
         held_zoomed = _get_box_center_and_position(page, MODEL)
         assert held_zoomed["scale"] > held["scale"] * 1.6
-        assert _close(held_zoomed["center"], held["center"]), (
-            f"zoom while held should not move the model: {held} -> {held_zoomed}"
-        )
+        assert _close(_pivot(page), held_pivot), "zoom while held should not move the centre"
 
         # During a two-handed grab the hands own the scale: stick is ignored.
         _move_controller(page, 0, cx, cy, cz + 1)

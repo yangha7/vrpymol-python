@@ -102,23 +102,27 @@ def test_static_mode_loads_and_switches_without_a_server(static_site):
         page.goto(url, wait_until="networkidle")
         _wait_loaded(page, "1crn__cartoon__default.glb")
 
-        assert page.is_visible("#rep-select")
-        assert not page.is_visible("#rep-checkboxes")
+        # only the baked representations are offered
+        offered = page.eval_on_selector_all("#rep-checkboxes input", "els => els.map(e => e.value)")
+        assert offered == ["cartoon", "sticks", "spheres"]
         assert not page.is_visible("#add-object-button")
         molecules = page.eval_on_selector_all("#molecule-select option", "els => els.map(e => e.value)")
         assert molecules == ["1crn", "caffeine"]
 
-        page.select_option("#rep-select", "sticks")
+        page.check("#rep-checkboxes input[value='sticks']")
         _wait_loaded(page, "1crn__sticks__default.glb")
+        page.uncheck("#rep-checkboxes input[value='cartoon']")
         page.select_option("#color-select", "chain")
         _wait_loaded(page, "1crn__sticks__chain.glb")
 
-        page.select_option("#rep-select", "cartoon")
+        # caffeine has no cartoon: asking for it switches it back off and,
+        # with nothing else shown, falls back to sticks
+        page.uncheck("#rep-checkboxes input[value='sticks']")
+        page.check("#rep-checkboxes input[value='cartoon']")
         page.select_option("#molecule-select", "caffeine")
-        page.wait_for_function(
-            "document.getElementById('hud').textContent.includes('nothing to show')",
-            timeout=5000,
-        )
+        _wait_loaded(page, "caffeine__sticks__chain.glb")
+        assert not page.is_checked("#rep-checkboxes input[value='cartoon']")
+        assert page.is_checked("#rep-checkboxes input[value='sticks']")
         assert errors == []
         browser.close()
 
@@ -136,7 +140,7 @@ def test_static_measurement_uses_baked_atoms(static_site):
         page.goto(url, wait_until="networkidle")
         _wait_loaded(page)
         page.select_option("#molecule-select", "caffeine")
-        page.select_option("#rep-select", "spheres")
+        page.check("#rep-checkboxes input[value='spheres']")
         _wait_loaded(page, "caffeine__spheres__default.glb")
         page.wait_for_timeout(300)  # atom table fetch
 
@@ -244,6 +248,15 @@ def test_quest3_emulator_trigger_selects_and_a_button_toggles_sequence(static_si
         page.evaluate("() => __xrDevice.controllers.right.updateButtonValue('trigger', 0)")
         assert page.evaluate("() => vrPymolDebug.grabbers") == []
         assert page.evaluate("() => vrPymolDebug.selectionMarkerCount") > 0
+
+        # Mixed representations work without a server: sticks for just the
+        # selected residue, fetched as a baked layer and masked in the page.
+        page.evaluate("() => vrPymolDebug.showRep('sticks')")
+        page.wait_for_function("() => vrPymolDebug.layerState('sticks') === 'ready'", timeout=10000)
+        sticks = page.evaluate("() => vrPymolDebug.layerTriangles('sticks')")
+        assert 0 < sticks["visible"] < sticks["total"] / 5, sticks
+        cartoon = page.evaluate("() => vrPymolDebug.layerTriangles('cartoon')")
+        assert cartoon["visible"] == cartoon["total"] > 0
 
         # A hides the board, A again brings it back.
         for expected in (False, True):

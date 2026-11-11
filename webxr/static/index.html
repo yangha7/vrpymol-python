@@ -35,7 +35,7 @@
     #add-object-button { margin-left: 4px; font-family: monospace; }
     #frame-slider { width: 60%; vertical-align: middle; }
     #selection-hud { min-height: 1.2em; margin: 4px 0; word-wrap: break-word; }
-    #toggle-sequence, #clear-selection { width: 100%; font-family: monospace; margin-top: 2px; }
+    #toggle-sequence, #clear-selection, #select-all, #invert-selection { width: 100%; font-family: monospace; margin-top: 2px; }
     #sequence-popout {
       position: fixed; left: 8px; bottom: 64px; right: 250px; z-index: 1;
       max-height: 45%; overflow-y: auto; border-radius: 4px;
@@ -90,7 +90,7 @@
       </label>
     </section>
     <section>
-      <h4 id="rep-heading">representation (combinable, like real PyMOL) &mdash; big molecules can take a while to switch</h4>
+      <h4 id="rep-heading">show as (combinable) &mdash; applies to the selection, or to everything when nothing is selected</h4>
       <div id="rep-checkboxes">
         <label class="rep-option"><input type="checkbox" value="cartoon" checked /> cartoon</label>
         <label class="rep-option"><input type="checkbox" value="sticks" /> sticks</label>
@@ -149,7 +149,9 @@
       <h4>select residues</h4>
       <label class="rep-option"><input type="checkbox" id="select-mode" /> click residues to select</label>
       <div id="selection-hud" class="slow-hint">nothing selected</div>
-      <button id="toggle-sequence" type="button">show sequence</button>
+      <button id="toggle-sequence" type="button">show menu and sequence</button>
+      <button id="select-all" type="button">select all</button>
+      <button id="invert-selection" type="button">invert selection</button>
       <button id="clear-selection" type="button">clear selection</button>
     </section>
     <section>

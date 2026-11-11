@@ -42,28 +42,37 @@ controls.target.copy(DEFAULT_CONTROLS_TARGET);
 controls.update();
 
 let currentModel = null;
-let currentFit = null; // {scale, position} computed once per load, reapplied by "reset view"
+let currentFit = null; // {scale, center, position} computed once per molecule, reapplied by "reset view"
 const loader = new GLTFLoader();
 
-// Fit whatever PyMOL exported (arbitrary molecule size, arbitrary offset from
-// its own camera-relative export) to a comfortable hand-held scale in front
-// of the viewer. Computed once from the model's own (untransformed) bounds
-// right after loading, then just reapplied verbatim on "reset view" -- no
-// need to recompute from the model's current (already-transformed) state.
-function computeFit(object) {
-  const box = new THREE.Box3().setFromObject(object);
-  const size = new THREE.Vector3();
-  box.getSize(size);
-  const center = new THREE.Vector3();
-  box.getCenter(center);
-  const maxDim = Math.max(size.x, size.y, size.z) || 1;
-  const targetSize = 0.3;
-  const scale = targetSize / maxDim;
+// --- scene: one layer per representation ---
+//
+// Each representation (cartoon, sticks, ...) of the current molecule is
+// loaded as its own glTF "layer" under one shared root, and the browser
+// decides residue by residue which part of each layer is drawn. That is what
+// lets part of a molecule be sticks and the rest cartoon without asking
+// PyMOL to re-export, so it also works in the static build where there is
+// no PyMOL to ask. Layers are fetched the first time something is shown in
+// them.
+//
+// The root (`currentModel`) is what gets fitted, grabbed and zoomed. It is
+// only replaced when the set of loaded objects changes, so changing
+// representation or colour no longer resets the view.
+
+function fitToAtoms(atoms) {
+  const box = new THREE.Box3();
+  const point = new THREE.Vector3();
+  for (const atom of atoms) box.expandByPoint(point.fromArray(atom.coord));
+  if (box.isEmpty()) box.setFromCenterAndSize(new THREE.Vector3(), new THREE.Vector3(2, 2, 2));
+  box.expandByScalar(2); // Angstroms: about one atom radius, so spheres fit too
+  const size = box.getSize(new THREE.Vector3());
+  const center = box.getCenter(new THREE.Vector3());
+  const targetSize = 0.3; // metres: a comfortable hand-held size
+  const scale = targetSize / Math.max(size.x, size.y, size.z);
   return {
     scale,
-    // model-local (the freshly loaded model still has an identity transform
-    // here), so it stays valid as the zoom pivot however the model is later
-    // moved, rotated, scaled or reparented.
+    // model-local, so it stays valid as the zoom pivot however the model is
+    // later moved, rotated, scaled or reparented.
     center,
     position: new THREE.Vector3(
       MODEL_ANCHOR.x - center.x * scale,
@@ -74,51 +83,401 @@ function computeFit(object) {
 }
 
 function applyFit(object, fit) {
+  // The fit position assumes an unrotated model, so the rotation a grab
+  // left behind has to go too, or "reset view" would put the molecule off
+  // to one side of where it belongs.
+  object.quaternion.identity();
   object.scale.setScalar(fit.scale);
   object.position.copy(fit.position);
 }
 
-let loadSeq = 0;
+function startNewModel(atoms) {
+  if (currentModel) currentModel.parent?.remove(currentModel);
+  // Everything that hung off the old model goes with it.
+  grabbers.length = 0;
+  twoHand = null;
+  measurementGroup = null;
+  pendingAtom = null;
+  measureHud.textContent = " ";
+  selectionMarkers = null;
+  currentModel = new THREE.Group();
+  currentModel.name = "molecule";
+  currentFit = fitToAtoms(atoms);
+  applyFit(currentModel, currentFit);
+  scene.add(currentModel);
+}
 
-function loadScene(url) {
-  const mySeq = ++loadSeq;
+let availableReps = []; // representations this build can draw, in menu order
+const shownByRep = new Map(); // rep -> Set of residue keys drawn in that rep
+const layers = new Map(); // rep -> {rep, state: "loading"|"ready"|"missing", root, parts}
+let staleLayers = []; // previous scene's layers, kept on screen until the new ones arrive
+let sceneRequestInFlight = false;
+
+function disposeLayer(layer) {
+  if (!layer.root) return;
+  layer.root.parent?.remove(layer.root);
+  layer.root.traverse((object) => {
+    object.geometry?.dispose();
+    object.material?.dispose?.();
+  });
+}
+
+// Spatial hash over atoms, for "which residue is this triangle part of".
+const GRID_CELL = 4; // Angstroms
+function gridKey(ix, iy, iz) {
+  return (ix * 73856093) ^ (iy * 19349663) ^ (iz * 83492791);
+}
+
+function buildAtomGrid(atoms) {
+  const grid = { atoms, cells: new Map() };
+  atoms.forEach((atom, i) => {
+    const key = gridKey(
+      Math.floor(atom.coord[0] / GRID_CELL),
+      Math.floor(atom.coord[1] / GRID_CELL),
+      Math.floor(atom.coord[2] / GRID_CELL),
+    );
+    if (!grid.cells.has(key)) grid.cells.set(key, []);
+    grid.cells.get(key).push(i);
+  });
+  return grid;
+}
+
+// Calls visit(atom, squaredDistance) for every atom in the cells within
+// `reach` cells of the point.
+function visitNearbyAtoms(grid, x, y, z, reach, visit) {
+  const cx = Math.floor(x / GRID_CELL);
+  const cy = Math.floor(y / GRID_CELL);
+  const cz = Math.floor(z / GRID_CELL);
+  for (let ix = cx - reach; ix <= cx + reach; ix++) {
+    for (let iy = cy - reach; iy <= cy + reach; iy++) {
+      for (let iz = cz - reach; iz <= cz + reach; iz++) {
+        const cell = grid.cells.get(gridKey(ix, iy, iz));
+        if (!cell) continue;
+        for (const i of cell) {
+          const atom = grid.atoms[i];
+          const dx = atom.coord[0] - x;
+          const dy = atom.coord[1] - y;
+          const dz = atom.coord[2] - z;
+          visit(atom, dx * dx + dy * dy + dz * dz);
+        }
+      }
+    }
+  }
+}
+
+function nearestAtom(grid, x, y, z) {
+  let best = null;
+  let bestDist = Infinity;
+  const visit = (atom, dist) => {
+    if (dist < bestDist) {
+      best = atom;
+      bestDist = dist;
+    }
+  };
+  // The nearest atom in the searched block of cells is the true nearest
+  // only if it is closer than the block's margin; widen until that holds.
+  for (const reach of [1, 2, 4]) {
+    visitNearbyAtoms(grid, x, y, z, reach, visit);
+    if (bestDist <= (reach * GRID_CELL) ** 2) return best;
+  }
+  for (const atom of grid.atoms) {
+    visit(atom, (atom.coord[0] - x) ** 2 + (atom.coord[1] - y) ** 2 + (atom.coord[2] - z) ** 2);
+  }
+  return best;
+}
+
+// PyMOL's van der Waals radii in Angstroms, for telling whose sphere a
+// triangle of the spheres layer belongs to.
+const VDW_RADIUS = { H: 1.2, C: 1.7, N: 1.55, O: 1.52, S: 1.8, P: 1.8, F: 1.47 };
+const VDW_DEFAULT = 1.8;
+
+let atomGrids = null; // built on demand for the current atom table
+
+function getAtomGrids() {
+  if (!atomGrids) {
+    // Cartoon and ribbon run through the C-alphas, so their triangles are
+    // matched against C-alphas only: cuts then fall midway between residues
+    // instead of wherever a side chain happens to come close. Residues with
+    // no C-alpha (nucleic acids, ligands) keep all their atoms.
+    const hasAlphaCarbon = new Set(
+      sceneAtoms.filter((atom) => atom.name === "CA").map((atom) => residueKey(atom)),
+    );
+    atomGrids = {
+      all: buildAtomGrid(sceneAtoms),
+      backbone: buildAtomGrid(
+        sceneAtoms.filter((atom) => atom.name === "CA" || !hasAlphaCarbon.has(residueKey(atom))),
+      ),
+    };
+  }
+  return atomGrids;
+}
+
+// Returns a function (x, y, z, nx, ny, nz) -> residue ordinal for a
+// triangle with that centroid and unit normal, in atom coordinates.
+function residueAssigner(rep) {
+  const grids = getAtomGrids();
+  const ordinalOf = (atom) => (atom ? residueByKey.get(residueKey(atom)).ordinal : -1);
+  if (rep === "cartoon" || rep === "ribbon") {
+    return (x, y, z) => ordinalOf(nearestAtom(grids.backbone, x, y, z));
+  }
+  if (rep !== "spheres") {
+    return (x, y, z) => ordinalOf(nearestAtom(grids.all, x, y, z));
+  }
+  // Space-filling spheres overlap, so "nearest atom centre" would hand the
+  // part of one atom's sphere that lies inside its neighbour to the
+  // neighbour, leaving a hole when only one of the two is shown. The owner
+  // is instead the atom whose sphere the triangle actually lies on: at its
+  // radius from the centre, facing straight out from it.
+  const sphereScale = Number(document.getElementById("sphere-scale").value) || 1;
+  return (x, y, z, nx, ny, nz) => {
+    let best = null;
+    let bestCost = Infinity;
+    visitNearbyAtoms(grids.all, x, y, z, 1, (atom, dist2) => {
+      const dist = Math.sqrt(dist2) || 1e-6;
+      const radius = (VDW_RADIUS[atom.element] || VDW_DEFAULT) * sphereScale;
+      const outward =
+        ((x - atom.coord[0]) * nx + (y - atom.coord[1]) * ny + (z - atom.coord[2]) * nz) / dist;
+      const cost = Math.abs(dist - radius) + (1 - Math.abs(outward)); // Angstroms
+      if (cost < bestCost) {
+        best = atom;
+        bestCost = cost;
+      }
+    });
+    return ordinalOf(best || nearestAtom(grids.all, x, y, z));
+  };
+}
+
+// Work out which residue every triangle of a freshly loaded layer belongs
+// to, and give each mesh an index buffer that can be rewritten to draw any
+// subset of them.
+function buildLayerParts(root, rep) {
+  const assign = residueAssigner(rep);
+  const parts = [];
+  const vertex = new THREE.Vector3();
+  root.updateMatrixWorld(true); // not yet in the scene, so "world" is the atom frame
+  root.traverse((object) => {
+    if (!object.isMesh) return;
+    const geometry = object.geometry;
+    const position = geometry.attributes.position;
+    const coords = new Float32Array(position.count * 3);
+    for (let i = 0; i < position.count; i++) {
+      vertex.fromBufferAttribute(position, i).applyMatrix4(object.matrixWorld);
+      coords[3 * i] = vertex.x;
+      coords[3 * i + 1] = vertex.y;
+      coords[3 * i + 2] = vertex.z;
+    }
+    let source;
+    if (geometry.index) {
+      source = geometry.index.array;
+    } else {
+      source = new Uint32Array(position.count);
+      for (let i = 0; i < source.length; i++) source[i] = i;
+    }
+    const triangleCount = Math.floor(source.length / 3);
+    const owner = new Int32Array(triangleCount);
+    for (let t = 0; t < triangleCount; t++) {
+      const a = 3 * source[3 * t];
+      const b = 3 * source[3 * t + 1];
+      const c = 3 * source[3 * t + 2];
+      const ux = coords[b] - coords[a];
+      const uy = coords[b + 1] - coords[a + 1];
+      const uz = coords[b + 2] - coords[a + 2];
+      const vx = coords[c] - coords[a];
+      const vy = coords[c + 1] - coords[a + 1];
+      const vz = coords[c + 2] - coords[a + 2];
+      let nx = uy * vz - uz * vy;
+      let ny = uz * vx - ux * vz;
+      let nz = ux * vy - uy * vx;
+      const length = Math.hypot(nx, ny, nz) || 1;
+      nx /= length;
+      ny /= length;
+      nz /= length;
+      owner[t] = assign(
+        (coords[a] + coords[b] + coords[c]) / 3,
+        (coords[a + 1] + coords[b + 1] + coords[c + 1]) / 3,
+        (coords[a + 2] + coords[b + 2] + coords[c + 2]) / 3,
+        nx,
+        ny,
+        nz,
+      );
+    }
+    // One reusable index buffer per mesh, rewritten in place and trimmed
+    // with drawRange, so toggling visibility never allocates GPU buffers.
+    const index = new THREE.BufferAttribute(new source.constructor(source.length), 1);
+    geometry.setIndex(index);
+    parts.push({ object, source, owner, index, visibleTriangles: 0 });
+  });
+  return parts;
+}
+
+function applyLayerMask(layer) {
+  const mask = new Uint8Array(allResidues.length);
+  for (const key of shownByRep.get(layer.rep)) {
+    const residue = residueByKey.get(key);
+    if (residue) mask[residue.ordinal] = 1;
+  }
+  for (const part of layer.parts) {
+    const out = part.index.array;
+    let n = 0;
+    for (let t = 0; t < part.owner.length; t++) {
+      const ordinal = part.owner[t];
+      if (ordinal < 0 || !mask[ordinal]) continue;
+      out[n++] = part.source[3 * t];
+      out[n++] = part.source[3 * t + 1];
+      out[n++] = part.source[3 * t + 2];
+    }
+    part.index.needsUpdate = true;
+    part.object.geometry.setDrawRange(0, n);
+    part.object.visible = n > 0;
+    part.visibleTriangles = n / 3;
+  }
+}
+
+function layerUrl(rep) {
+  if (staticManifest) {
+    return staticManifest.files[`${sceneObjects.mol}|${rep}|${colorSelect.value}`] || null;
+  }
+  // cache-bust: the server re-exports on every request
+  return `/api/layer?rep=${encodeURIComponent(rep)}&t=${Date.now()}`;
+}
+
+function anyLayerLoading() {
+  return Array.from(layers.values()).some((layer) => layer.state === "loading");
+}
+
+// The live server exports one thing at a time on a single thread, so while
+// it is working the controls show as busy instead of quietly queueing more.
+function refreshBusy() {
+  setControlsBusy(!staticManifest && (sceneRequestInFlight || anyLayerLoading()));
+}
+
+function layerSettled() {
+  if (!anyLayerLoading()) {
+    staleLayers.forEach(disposeLayer);
+    staleLayers = [];
+  }
+  refreshBusy();
+  requestSequenceRedraw();
+}
+
+// A representation with nothing to draw for this molecule (cartoon of a
+// small molecule, nonbonded of a protein with no waters): switch it back
+// off, and if that leaves the scene empty fall back to sticks.
+function layerMissing(layer) {
+  layer.state = "missing";
+  shownByRep.get(layer.rep).clear();
+  hud.textContent = `${layer.rep}: nothing to draw for this molecule`;
+  const nothingShown = availableReps.every((rep) => shownByRep.get(rep).size === 0);
+  if (nothingShown && availableReps.includes("sticks") && layers.get("sticks")?.state !== "missing") {
+    allResidues.forEach((residue) => shownByRep.get("sticks").add(residue.key));
+  }
+  layerSettled();
+  representationChanged();
+}
+
+function loadLayer(rep) {
+  const layer = { rep, state: "loading", root: null, parts: [] };
+  layers.set(rep, layer);
+  const url = layerUrl(rep);
+  if (!url) {
+    layerMissing(layer);
+    return;
+  }
   hud.textContent = `loading ${url} ...`;
   loader.load(
     url,
     (gltf) => {
-      // A newer load was started while this one downloaded (baked files can
-      // be several MB) -- don't let the stale one replace it.
-      if (mySeq !== loadSeq) return;
-      if (currentModel) {
-        currentModel.parent?.remove(currentModel);
-      }
-      grabbers.length = 0;
-      twoHand = null;
-      // Measurements are children of the old model (see ensureMeasurementGroup)
-      // and get discarded along with it -- rebuilding the scene (molecule/rep/
-      // color/setting change) always clears any in-progress or completed
-      // measurement, same as it already resets grab/fit state above.
-      measurementGroup = null;
-      pendingAtom = null;
-      if (measureHud) measureHud.textContent = " ";
-      currentModel = gltf.scene;
-      currentFit = computeFit(currentModel);
-      applyFit(currentModel, currentFit);
-      scene.add(currentModel);
-      // Selection markers were children of the old model too. The static
-      // build already has this molecule's atoms; the live server is asked
-      // again, since objects and frames move atoms between scenes.
-      selectionMarkers = null;
-      if (staticManifest) rebuildSelectionMarkers();
-      else refreshSceneAtoms(mySeq);
+      // The scene moved on while this downloaded (baked files can be
+      // several MB) -- don't let a stale layer into the new scene.
+      if (layers.get(rep) !== layer) return;
+      layer.root = gltf.scene;
+      layer.root.name = `layer-${rep}`;
+      layer.parts = buildLayerParts(layer.root, rep);
+      currentModel.add(layer.root);
+      layer.state = "ready";
+      applyLayerMask(layer);
       hud.textContent = `loaded ${url}`;
+      layerSettled();
     },
     undefined,
     (error) => {
-      hud.textContent = `failed to load ${url}: ${error}`;
-      console.error(error);
+      if (layers.get(rep) !== layer) return;
+      console.warn(`no ${rep} layer:`, error);
+      layerMissing(layer);
     },
   );
+}
+
+// Bring what is drawn in line with `shownByRep`: fetch layers that are now
+// needed, and re-mask the ones already loaded.
+function ensureLayers() {
+  for (const rep of availableReps) {
+    const layer = layers.get(rep);
+    if (!layer) {
+      if (shownByRep.get(rep).size > 0) loadLayer(rep);
+    } else if (layer.state === "ready") {
+      applyLayerMask(layer);
+    }
+  }
+  layerSettled();
+}
+
+function representationChanged() {
+  ensureLayers();
+  syncRepControls();
+  requestSequenceRedraw();
+}
+
+// Show and hide act on the selection, or on everything when nothing is
+// selected -- the same rule as PyMOL's "show sticks" with and without `sele`.
+function targetResidues() {
+  return selectedKeys.size > 0 ? selectedResidues() : allResidues;
+}
+
+function setRepShown(rep, residues, shown) {
+  const keys = shownByRep.get(rep);
+  for (const residue of residues) {
+    if (shown) keys.add(residue.key);
+    else keys.delete(residue.key);
+  }
+  representationChanged();
+}
+
+function hideEverything(residues) {
+  for (const keys of shownByRep.values()) {
+    for (const residue of residues) keys.delete(residue.key);
+  }
+  representationChanged();
+}
+
+// Reload the scene after the molecule, objects, frame, colouring or an
+// export setting changed: new atom table, new layers. The view and what is
+// shown where are kept when the objects are the same ones as before.
+let sceneEpoch = 0;
+async function syncScene() {
+  const epoch = ++sceneEpoch;
+  staleLayers.push(...layers.values());
+  layers.clear();
+  let atoms;
+  let objects;
+  if (staticManifest) {
+    const molecule = moleculeSelect.value;
+    staticAtoms = null; // never pick against the previous molecule's atoms
+    atoms = await loadStaticAtoms(molecule);
+    objects = { mol: molecule };
+    if (epoch !== sceneEpoch) return;
+    staticAtoms = atoms;
+  } else {
+    const data = await (await fetch("/api/atoms")).json();
+    if (epoch !== sceneEpoch || !data.ok) return; // a newer sync has taken over
+    atoms = data.atoms;
+    objects = Object.fromEntries(data.objects.map((o) => [o.name, o.molecule]));
+  }
+  if (!currentModel || JSON.stringify(objects) !== JSON.stringify(sceneObjects)) {
+    startNewModel(atoms);
+  }
+  setSceneAtoms(atoms, objects);
+  representationChanged();
 }
 
 function resetView() {
@@ -127,6 +486,9 @@ function resetView() {
     // reattach to the scene first so the fit position below is world-space.
     scene.attach(currentModel);
     applyFit(currentModel, currentFit);
+    // so a ray cast before the next rendered frame sees the model where
+    // it now is, not where it was
+    currentModel.updateMatrixWorld(true);
   }
   grabbers.length = 0;
   twoHand = null;
@@ -508,6 +870,7 @@ const sequencePopout = document.getElementById("sequence-popout");
 let sceneAtoms = [];
 let sceneObjects = {}; // object name -> molecule id, to tell when a selection is stale
 let residueByKey = new Map(); // every residue, waters included
+let allResidues = []; // the same, as a list; residue.ordinal is its position here
 let sequenceResidues = []; // the ones shown in the sequence, in display order
 let sequenceChains = []; // [{object, chain, residues}]
 const selectedKeys = new Set();
@@ -555,32 +918,46 @@ function buildResidues() {
   sequenceResidues.forEach((residue, index) => {
     residue.index = index;
   });
+  allResidues = Array.from(residueByKey.values());
+  allResidues.forEach((residue, ordinal) => {
+    residue.ordinal = ordinal;
+  });
 }
 
-// `atoms` null means "between scenes": the table is emptied but the
-// selection is kept, so it can be restored if the next scene is the same
-// molecule (a representation or colour change).
+// Install a new atom table. The selection, and what is shown in which
+// representation, carry over for residues of objects that are still the
+// same molecule. A representation that covered the whole scene keeps
+// covering it, so "everything as spheres" survives switching molecule.
 function setSceneAtoms(atoms, objects) {
-  sceneAtoms = atoms || [];
+  const previousCount = allResidues.length;
+  const coveredEverything = new Set(
+    availableReps.filter((rep) => previousCount > 0 && shownByRep.get(rep).size === previousCount),
+  );
+  const objectsChanged = JSON.stringify(objects) !== JSON.stringify(sceneObjects);
+  sceneAtoms = atoms;
+  atomGrids = null;
   buildResidues();
-  if (atoms) {
-    for (const key of Array.from(selectedKeys)) {
-      const objectName = key.split("|")[0];
-      if (objects[objectName] !== sceneObjects[objectName] || !residueByKey.has(key)) {
-        selectedKeys.delete(key);
-      }
-    }
-    sceneObjects = objects;
+  const isStale = (key) => {
+    const objectName = key.split("|")[0];
+    return objects[objectName] !== sceneObjects[objectName] || !residueByKey.has(key);
+  };
+  for (const key of Array.from(selectedKeys)) {
+    if (isStale(key)) selectedKeys.delete(key);
   }
+  for (const rep of availableReps) {
+    const keys = shownByRep.get(rep);
+    for (const key of Array.from(keys)) {
+      if (isStale(key)) keys.delete(key);
+    }
+    if (coveredEverything.has(rep)) allResidues.forEach((residue) => keys.add(residue.key));
+  }
+  if (objectsChanged && availableReps.every((rep) => shownByRep.get(rep).size === 0)) {
+    const initial = availableReps.includes("cartoon") ? "cartoon" : availableReps[0];
+    allResidues.forEach((residue) => shownByRep.get(initial).add(residue.key));
+  }
+  sceneObjects = objects;
   layoutSequence();
   selectionChanged();
-}
-
-async function refreshSceneAtoms(mySeq) {
-  const response = await fetch("/api/atoms");
-  const data = await response.json();
-  if (mySeq !== loadSeq || !data.ok) return; // a newer scene has replaced this one
-  setSceneAtoms(data.atoms, Object.fromEntries(data.objects.map((o) => [o.name, o.molecule])));
 }
 
 function selectedResidues() {
@@ -689,6 +1066,14 @@ function clearSelection() {
   selectionChanged();
 }
 
+function invertSelection() {
+  for (const residue of allResidues) {
+    if (selectedKeys.has(residue.key)) selectedKeys.delete(residue.key);
+    else selectedKeys.add(residue.key);
+  }
+  selectionChanged();
+}
+
 // Point is in the model's local frame (Angstroms). Toggles the residue that
 // owns the nearest atom and returns it.
 function selectLocalPoint(x, y, z) {
@@ -738,8 +1123,12 @@ measureToggle.addEventListener("change", () => {
   if (measureToggle.checked) selectToggle.checked = false;
 });
 clearSelectionButton.addEventListener("click", clearSelection);
+document.getElementById("select-all").addEventListener("click", () => {
+  setResiduesSelected(allResidues, true);
+});
+document.getElementById("invert-selection").addEventListener("click", invertSelection);
 
-// --- sequence window ---
+// --- menu window: show/hide buttons and the sequence ---
 //
 // One canvas, used twice: as an ordinary element in the desktop pop-out, and
 // as the texture of a board in the 3D scene -- an immersive session shows
@@ -749,9 +1138,15 @@ clearSelectionButton.addEventListener("click", clearSelection);
 
 const SEQ_WIDTH = 1024; // layout units; the canvas has SEQ_PIXEL_RATIO pixels per unit
 const SEQ_PIXEL_RATIO = 2;
-const SEQ_MAX_HEIGHT = 900;
+const SEQ_MAX_HEIGHT = 1024;
 const SEQ_PAD = 14;
-const SEQ_HEADER = 78;
+const SEQ_ROW_SHOW = 76; // top of each button row
+const SEQ_ROW_HIDE = 114;
+const SEQ_ROW_SELECT = 152;
+const SEQ_ROW_HEIGHT = 32;
+const SEQ_ROW_LABEL = 70; // width of the "show"/"hide"/"select" labels
+const SEQ_BUTTON_GAP = 6;
+const SEQ_HEADER = 204; // where the sequence starts
 const SEQ_GUTTER = 84;
 // No scrolling in VR, so long sequences get more (smaller) letters per row
 // until the whole thing fits on one board.
@@ -777,7 +1172,7 @@ seqPanel.visible = false;
 scene.add(seqPanel);
 
 let seqLayout = { height: SEQ_HEADER + SEQ_PAD, cellW: 0, cellH: 0, labels: [], ticks: [] };
-let seqItems = []; // hit targets: {x, y, w, h, residue} or {x, y, w, h, action}
+let seqItems = []; // hit targets: {x, y, w, h, residue} or {x, y, w, h, action: {kind, rep, label}}
 let seqHover = null;
 let seqDrag = null; // {source, add, lastIndex} while a sweep is in progress
 let seqDirty = true;
@@ -819,8 +1214,78 @@ function layoutSequenceWith(columns) {
     });
     y += tickSize + cellH + 12;
   }
-  items.push({ x: SEQ_WIDTH - SEQ_PAD - 96, y: 10, w: 96, h: 34, action: "clear" });
+  items.push(...menuButtons());
   return { layout: { height: y + SEQ_PAD, cellW, cellH, tickSize, labels, ticks }, items };
+}
+
+// The button rows: show and hide per representation (PyMOL's S and H
+// menus), then the selection helpers.
+function menuButtons() {
+  const items = [];
+  const left = SEQ_PAD + SEQ_ROW_LABEL;
+  const slots = availableReps.length + 1; // the hide row has one extra: "everything"
+  const width = (SEQ_WIDTH - SEQ_PAD - left + SEQ_BUTTON_GAP) / slots - SEQ_BUTTON_GAP;
+  const button = (slot, y, w, action) => ({
+    x: left + slot * (w + SEQ_BUTTON_GAP),
+    y,
+    w,
+    h: SEQ_ROW_HEIGHT,
+    action,
+  });
+  availableReps.forEach((rep, i) => {
+    items.push(button(i, SEQ_ROW_SHOW, width, { kind: "show", rep, label: rep }));
+    items.push(button(i, SEQ_ROW_HIDE, width, { kind: "hide", rep, label: rep }));
+  });
+  items.push(button(availableReps.length, SEQ_ROW_HIDE, width, { kind: "hideAll", label: "everything" }));
+  ["selectAll", "invert", "clear"].forEach((kind, i) => {
+    const label = { selectAll: "all", invert: "invert", clear: "none" }[kind];
+    items.push(button(i, SEQ_ROW_SELECT, 110, { kind, label }));
+  });
+  return items;
+}
+
+function describeTarget() {
+  const count = selectedKeys.size;
+  return count > 0 ? `the selection (${count} residue${count === 1 ? "" : "s"})` : "the whole molecule";
+}
+
+function describeAction(action) {
+  switch (action.kind) {
+    case "show":
+      return `show ${describeTarget()} as ${action.rep}`;
+    case "hide":
+      return `hide ${action.rep} of ${describeTarget()}`;
+    case "hideAll":
+      return `hide ${describeTarget()} completely`;
+    case "selectAll":
+      return "select every residue";
+    case "invert":
+      return "swap selected and unselected";
+    default:
+      return "clear the selection";
+  }
+}
+
+function runMenuAction(action) {
+  switch (action.kind) {
+    case "show":
+      setRepShown(action.rep, targetResidues(), true);
+      break;
+    case "hide":
+      setRepShown(action.rep, targetResidues(), false);
+      break;
+    case "hideAll":
+      hideEverything(targetResidues());
+      break;
+    case "selectAll":
+      setResiduesSelected(allResidues, true);
+      break;
+    case "invert":
+      invertSelection();
+      break;
+    default:
+      clearSelection();
+  }
 }
 
 function layoutSequence() {
@@ -862,19 +1327,34 @@ function drawSequence() {
   ctx.font = "18px monospace";
   ctx.fillStyle = SEQ_SELECTED_COLOR;
   const count = selectedResidues().length;
-  const status = seqHover?.residue
-    ? describeResidue(seqHover.residue)
-    : sequenceResidues.length === 0
-      ? "no sequence loaded"
-      : `${count} residue${count === 1 ? "" : "s"} selected`;
+  let status;
+  if (seqHover?.residue) status = describeResidue(seqHover.residue);
+  else if (seqHover?.action) status = describeAction(seqHover.action);
+  else if (anyLayerLoading()) status = "loading ...";
+  else if (sequenceResidues.length === 0) status = "no sequence loaded";
+  else status = `${count} residue${count === 1 ? "" : "s"} selected`;
   ctx.fillText(status, SEQ_PAD + 150, 28);
   ctx.font = "14px monospace";
   ctx.fillStyle = "#9aa6cc";
   ctx.fillText(
-    "trigger: select, sweep for a range | grip: grab | stick: zoom | A/B: hide this window",
+    "trigger: press a button or a residue, sweep for a range | grip: grab | stick: zoom | A/B: hide this window",
     SEQ_PAD,
-    58,
+    56,
   );
+
+  ctx.font = "16px monospace";
+  ctx.fillStyle = "#c8d0ee";
+  const rowMiddle = SEQ_ROW_HEIGHT / 2 + 1;
+  ctx.fillText("show", SEQ_PAD, SEQ_ROW_SHOW + rowMiddle);
+  ctx.fillText("hide", SEQ_PAD, SEQ_ROW_HIDE + rowMiddle);
+  ctx.fillText("select", SEQ_PAD, SEQ_ROW_SELECT + rowMiddle);
+  ctx.fillStyle = "#9aa6cc";
+  ctx.fillText(
+    `show and hide act on ${describeTarget()}`,
+    SEQ_PAD + SEQ_ROW_LABEL + 3 * (110 + SEQ_BUTTON_GAP) + 10,
+    SEQ_ROW_SELECT + rowMiddle,
+  );
+  const target = targetResidues();
 
   ctx.fillStyle = "#c8d0ee";
   for (const label of seqLayout.labels) ctx.fillText(label.text, SEQ_PAD, label.y, SEQ_GUTTER - 8);
@@ -888,11 +1368,15 @@ function drawSequence() {
   const letterSize = Math.min(seqLayout.cellH * 0.75, seqLayout.cellW * 1.3);
   for (const item of seqItems) {
     if (item.action) {
-      ctx.fillStyle = item === seqHover ? "#5a6a9a" : "#2a3558";
+      // a "show" button is lit while any of the target is drawn that way
+      const lit =
+        item.action.kind === "show" &&
+        target.some((residue) => shownByRep.get(item.action.rep).has(residue.key));
+      ctx.fillStyle = item === seqHover ? "#5a6a9a" : lit ? "#2f7d5b" : "#2a3558";
       ctx.fillRect(item.x, item.y, item.w, item.h);
       ctx.fillStyle = "#ffffff";
-      ctx.font = "18px monospace";
-      ctx.fillText(item.action, item.x + item.w / 2, item.y + item.h / 2);
+      ctx.font = "15px monospace";
+      ctx.fillText(item.action.label, item.x + item.w / 2, item.y + item.h / 2 + 1, item.w - 6);
       continue;
     }
     const selected = selectedKeys.has(item.residue.key);
@@ -929,8 +1413,8 @@ function setSequenceHover(item) {
 // hand hovering can't interfere with a sweep the other hand started.
 function sequencePointerDown(item, source) {
   if (!item) return;
-  if (item.action === "clear") {
-    clearSelection();
+  if (item.action) {
+    runMenuAction(item.action);
     return;
   }
   // The first residue decides the whole sweep: starting on an unselected
@@ -976,7 +1460,9 @@ seqCanvas.addEventListener("pointerleave", () => setSequenceHover(null));
 window.addEventListener("pointerup", () => sequencePointerUp("mouse"));
 toggleSequenceButton.addEventListener("click", () => {
   sequencePopout.hidden = !sequencePopout.hidden;
-  toggleSequenceButton.textContent = sequencePopout.hidden ? "show sequence" : "hide sequence";
+  toggleSequenceButton.textContent = sequencePopout.hidden
+    ? "show menu and sequence"
+    : "hide menu and sequence";
 });
 
 // What a controller's ray is on: `undefined` when it misses the board (or
@@ -1111,9 +1597,6 @@ renderer.setAnimationLoop((time) => {
   renderer.render(scene, camera);
 });
 
-// Exposed so the Flask-served page (and Playwright tests) can trigger loads
-// without a full page reload -- also used by the molecule/rep switcher below.
-window.vrPymolLoadScene = loadScene;
 window.vrPymolResetView = resetView;
 // for Playwright tests to introspect/drive view + grab state without a real
 // WebXR session (no XR device is available in headless Chromium): tests
@@ -1130,6 +1613,30 @@ window.vrPymolDebug = {
   onTriggerEnd: (i) => onTriggerEnd({ target: controllers[i] }),
   selectLocalPoint,
   clearSelection,
+  // show/hide a representation for the selection (or everything), exactly
+  // as the menu buttons and side-panel checkboxes do
+  showRep: (rep) => setRepShown(rep, targetResidues(), true),
+  hideRep: (rep) => setRepShown(rep, targetResidues(), false),
+  shownCount: (rep) => shownByRep.get(rep).size,
+  layerState: (rep) => layers.get(rep)?.state ?? "unloaded",
+  // {total, visible} triangle counts of a loaded layer
+  layerTriangles(rep) {
+    const parts = layers.get(rep)?.parts ?? [];
+    return {
+      total: parts.reduce((sum, part) => sum + part.owner.length, 0),
+      visible: parts.reduce((sum, part) => sum + part.visibleTriangles, 0),
+    };
+  },
+  // where a menu button is drawn, in the same form as sequenceCell
+  menuButton(kind, rep) {
+    const item = seqItems.find((it) => it.action && it.action.kind === kind && it.action.rep === rep);
+    const u = (item.x + item.w / 2) / SEQ_WIDTH;
+    const v = (item.y + item.h / 2) / seqLayout.height;
+    seqPanel.updateMatrixWorld(true);
+    const world = seqPanel.localToWorld(new THREE.Vector3(u - 0.5, 0.5 - v, 0));
+    const normal = new THREE.Vector3(0, 0, 1).transformDirection(seqPanel.matrixWorld);
+    return { u, v, world: world.toArray(), normal: normal.toArray() };
+  },
   selectionExpression,
   toggleSequencePanel,
   get selectedKeys() {
@@ -1163,6 +1670,10 @@ window.vrPymolDebug = {
   stickZoom: (stickY, dt) => zoomModel(stickZoomFactor(stickY, dt)),
   get model() {
     return currentModel;
+  },
+  // world position of the point zoom scales about (the molecule's centre)
+  get zoomPivot() {
+    return currentModel.localToWorld(currentFit.center.clone()).toArray();
   },
   // deterministic measurement testing, bypassing real mouse-event/raycast
   // coordinate math (which real clicks still exercise via onCanvasClick):
@@ -1337,9 +1848,9 @@ async function addObject() {
       return;
     }
     applyObjectsAndFrame(data);
-    loadScene(`/scene.gltf?t=${Date.now()}`);
+    await syncScene();
   } finally {
-    setControlsBusy(false);
+    refreshBusy();
   }
 }
 
@@ -1354,9 +1865,9 @@ async function removeObject(name) {
       return;
     }
     applyObjectsAndFrame(data);
-    loadScene(`/scene.gltf?t=${Date.now()}`);
+    await syncScene();
   } finally {
-    setControlsBusy(false);
+    refreshBusy();
   }
 }
 
@@ -1379,12 +1890,11 @@ function scheduleApplySelection() {
 // fixed grid of molecule x representation x color through the same real
 // PyMOL pipeline and writes baked/manifest.json, pointed to by a meta tag
 // in its copy of index.html; that switches the page to loading those files. Only controls with a baked equivalent
-// stay visible: one representation preset at a time (instead of free
-// combination), color scheme, background, measure, reset view.
+// stay visible: the baked representations, color scheme, background,
+// selection, measure, reset view.
 let staticManifest = null;
 let staticAtoms = null;
 const staticAtomCache = new Map();
-let staticRepSelect = null;
 
 // bake_static.py marks its copy of index.html with this meta tag, so the
 // live-server page never makes a probing request that would 404.
@@ -1402,20 +1912,9 @@ function setUpStaticControls(manifest) {
   for (const option of Array.from(moleculeSelect.options)) {
     if (!manifest.molecules.includes(option.value)) option.remove();
   }
-  const repContainer = document.getElementById("rep-checkboxes");
-  repContainer.hidden = true;
-  document.getElementById("rep-heading").textContent = "representation";
-  staticRepSelect = document.createElement("select");
-  staticRepSelect.id = "rep-select";
-  for (const rep of manifest.reps) {
-    const option = document.createElement("option");
-    option.value = rep;
-    option.textContent = rep.replace("+", " + ");
-    staticRepSelect.appendChild(option);
+  for (const checkbox of repCheckboxes) {
+    if (!manifest.reps.includes(checkbox.value)) checkbox.closest("label").remove();
   }
-  repContainer.after(staticRepSelect);
-  staticRepSelect.addEventListener("change", scheduleApplySelection);
-  allControls.push(staticRepSelect);
 }
 
 async function loadStaticAtoms(molecule) {
@@ -1426,38 +1925,12 @@ async function loadStaticAtoms(molecule) {
   return staticAtomCache.get(molecule);
 }
 
-async function applyStaticSelection() {
-  const molecule = moleculeSelect.value;
-  const rep = staticRepSelect.value;
-  const color = colorSelect.value;
-  const url = staticManifest.files[`${molecule}|${rep}|${color}`];
-  if (!url) {
-    hud.textContent = `${molecule} has nothing to show as ${rep} -- try another representation`;
-    return;
-  }
-  const mySeq = ++sceneRequestSeq;
-  staticAtoms = null; // never pick against the previous molecule's atoms
-  setSceneAtoms(null);
-  loadScene(url);
-  const atoms = await loadStaticAtoms(molecule);
-  if (mySeq === sceneRequestSeq) {
-    staticAtoms = atoms;
-    setSceneAtoms(atoms, { mol: molecule });
-  }
-}
-
 async function applySelection() {
   if (staticManifest) {
-    await applyStaticSelection();
+    await syncScene();
     return;
   }
   const molecule = moleculeSelect.value;
-  const reps = repCheckboxes.filter((cb) => cb.checked).map((cb) => cb.value);
-  if (reps.length === 0) {
-    hud.textContent = "select at least one representation";
-    return;
-  }
-  const rep = reps.join("+");
   const hydrogens = showHydrogens.checked ? 1 : 0;
   const waters = showWaters.checked ? 1 : 0;
   const color = colorSelect.value;
@@ -1475,18 +1948,16 @@ async function applySelection() {
   // waiting for an older request; the server is still working through its
   // backlog up to and including whatever request is current now, and only
   // that request's own response proves the server has actually caught up.
-  setControlsBusy(true);
+  sceneRequestInFlight = true;
+  refreshBusy();
 
-  const SLOW_REPS = ["surface", "mesh", "dots"];
-  const includesSlowRep = reps.some((r) => SLOW_REPS.includes(r));
-  hud.textContent = includesSlowRep
-    ? `switching to ${molecule} / ${rep} ... (surface/mesh/dots can take a while, controls disabled until it finishes)`
-    : `switching to ${molecule} / ${rep} ...`;
+  hud.textContent = `switching to ${molecule} ...`;
   let response;
   try {
     response = await fetch(
-      `/api/scene?molecule=${encodeURIComponent(molecule)}` +
-        `&rep=${encodeURIComponent(rep)}` +
+      // export=0: only update the PyMOL session; each representation is
+      // then exported on its own by /api/layer as the scene needs it
+      `/api/scene?export=0&molecule=${encodeURIComponent(molecule)}` +
         `&hydrogens=${hydrogens}&waters=${waters}` +
         `&color=${encodeURIComponent(color)}` +
         `&stick_radius=${stickRadius.value}&sphere_scale=${sphereScale.value}` +
@@ -1496,28 +1967,40 @@ async function applySelection() {
     );
   } catch (error) {
     if (error.name === "AbortError") return; // superseded by a newer request
-    setControlsBusy(false);
+    sceneRequestInFlight = false;
+    refreshBusy();
     hud.textContent = `failed to switch: ${error}`;
     return;
   }
   // A newer request has since been issued (and its own response may already
   // have loaded) -- this one is stale, don't let it overwrite newer state.
   if (mySeq !== sceneRequestSeq) return;
-  setControlsBusy(false);
+  sceneRequestInFlight = false;
+  refreshBusy();
   if (!response.ok) {
     hud.textContent = `failed to switch: ${response.status}`;
     return;
   }
   const data = await response.json();
   applyObjectsAndFrame(data);
-  // cache-bust: the server overwrites the same path each time, and the
-  // no-store header on /scene.gltf covers most browsers, but GLTFLoader's
-  // internal fetch caching is bypassed reliably with a query param too.
-  loadScene(`/scene.gltf?t=${Date.now()}`);
+  await syncScene();
+}
+
+// A representation checkbox shows or hides that representation for the
+// selection, or for everything when nothing is selected. Nothing is sent to
+// the server for this beyond fetching a layer the first time it is needed.
+function syncRepControls() {
+  for (const checkbox of repCheckboxes) {
+    const count = shownByRep.get(checkbox.value)?.size ?? 0;
+    checkbox.checked = count > 0;
+    checkbox.indeterminate = count > 0 && count < allResidues.length; // only part of the scene
+  }
 }
 
 moleculeSelect.addEventListener("change", scheduleApplySelection);
-repCheckboxes.forEach((cb) => cb.addEventListener("change", scheduleApplySelection));
+repCheckboxes.forEach((cb) => {
+  cb.addEventListener("change", () => setRepShown(cb.value, targetResidues(), cb.checked));
+});
 showHydrogens.addEventListener("change", scheduleApplySelection);
 showWaters.addEventListener("change", scheduleApplySelection);
 colorSelect.addEventListener("change", scheduleApplySelection);
@@ -1532,10 +2015,10 @@ resetViewButton.addEventListener("click", resetView);
 window.vrPymolApplySelection = applySelection;
 
 staticManifest = await detectStaticMode();
-if (staticManifest) {
-  setUpStaticControls(staticManifest);
-  await applyStaticSelection();
-} else {
-  loadScene("/scene.gltf");
-  refreshObjects();
-}
+if (staticManifest) setUpStaticControls(staticManifest);
+availableReps = repCheckboxes
+  .map((checkbox) => checkbox.value)
+  .filter((rep) => !staticManifest || staticManifest.reps.includes(rep));
+availableReps.forEach((rep) => shownByRep.set(rep, new Set()));
+await syncScene();
+if (!staticManifest) refreshObjects();
