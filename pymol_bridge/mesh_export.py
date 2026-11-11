@@ -25,5 +25,15 @@ def export_wrl(session, path=None):
         import os
 
         os.close(fd)
+    # PyMOL's VRML2 writer emits camera-space coordinates: each atom relative
+    # to the view's centre of rotation, turned by the view rotation. Atom
+    # picking and selection markers place things by real atom coordinates, so
+    # the view is put at "no rotation, rotating about the model origin" for
+    # the save, which makes the two frames identical. The viewer does its own
+    # framing, so what PyMOL's camera was looking at doesn't matter.
+    view = list(session.cmd.get_view())
+    view[0:9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]  # rotation
+    view[12:15] = [0.0, 0.0, 0.0]  # centre of rotation, model frame, Angstroms
+    session.cmd.set_view(view)
     session.cmd.save(path)
     return path

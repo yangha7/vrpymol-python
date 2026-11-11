@@ -175,3 +175,35 @@ def test_select_by_pointing_and_by_sequence(live_server):
         browser.close()
 
     assert not page_errors, f"uncaught JS errors: {page_errors}"
+
+
+def test_exported_geometry_is_in_the_atom_table_frame(client, tmp_path):
+    """Markers and picking place atoms by their PyMOL coordinates, so the
+    exported geometry has to be in that same frame. PyMOL's VRML2 writer
+    works in camera space (coordinates relative to the view's centre of
+    rotation, turned by the view rotation), which after a plain `load` is
+    the molecule shifted by its own centre: invisible for caffeine, which
+    sits at the origin, and ~10 Angstroms off for a real protein.
+    """
+    import re
+
+    import numpy as np
+
+    from pymol_bridge.mesh_export import export_wrl
+    from webxr import server
+
+    client.get("/api/scene?molecule=1crn&rep=spheres")
+    session = server._get_session()
+    session.cmd.turn("y", 40)  # a rotated view must not leak into the export either
+    with open(export_wrl(session, str(tmp_path / "scene.wrl"))) as f:
+        centres = np.array(
+            re.findall(r"translation\s+(\S+)\s+(\S+)\s+(\S+)\s+children Shape \{\s+geometry Sphere", f.read()),
+            dtype=float,
+        )
+    atoms = np.array([a["coord"] for a in server.atom_table(session)])
+    assert len(centres) == len(atoms) == 327
+    # the writer's sphere order is not the atom order, so pair each atom
+    # with its nearest sphere; (327, 327) distances, in Angstroms
+    distances = np.linalg.norm(atoms[:, None, :] - centres[None, :, :], axis=2)
+    assert distances.min(axis=1).max() < 2e-3
+    assert len(set(distances.argmin(axis=1))) == 327  # one sphere per atom
