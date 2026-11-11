@@ -91,3 +91,34 @@ def test_cartoon_smooth_loops_setting_changes_exported_cartoon_mesh():
         molecule="1crn", rep="cartoon", cartoon_smooth_loops=True
     )
     assert leftover_off != leftover_on
+
+
+def _exported_vertex_colors():
+    """Distinct COLOR_0 values in the glTF the frontend actually loads, as
+    (r, g, b) tuples in 0-255."""
+    from vr_pymol.glb_pack import _read_gltf
+
+    gltf, accessor = _read_gltf(GLTF_PATH)
+    colors = set()
+    for mesh in gltf["meshes"]:
+        for prim in mesh["primitives"]:
+            values = accessor(prim["attributes"]["COLOR_0"])[:, :3]
+            if values.dtype != "uint8":
+                values = (values * 255).round()
+            colors |= {tuple(int(v) for v in rgb) for rgb in values}
+    return colors
+
+
+def test_cartoon_coloring_survives_export_to_gltf():
+    # Cartoon is the one representation PyMOL bakes into a mesh with a colour
+    # per vertex (spheres and sticks carry one colour per primitive, which is
+    # all the tests above look at), so it is checked on the final glTF.
+    rebuild_scene(molecule="1crn", rep="cartoon", color="rainbow")
+    rainbow = _exported_vertex_colors()
+    # util.chainbow runs blue (N terminus) to red (C terminus)
+    assert len(rainbow) > 20, f"expected a spectrum, got {sorted(rainbow)[:5]}"
+    assert any(b > 200 and r < 60 and g < 60 for r, g, b in rainbow), "no blue N terminus"
+    assert any(r > 200 and g < 60 and b < 60 for r, g, b in rainbow), "no red C terminus"
+
+    rebuild_scene(molecule="4hhb", rep="cartoon", color="chain")
+    assert len(_exported_vertex_colors()) == 4  # one colour per chain

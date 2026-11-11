@@ -149,6 +149,33 @@ def _cylinder_actor(cylinders):
     return actor
 
 
+def _bake_vertex_colors(actor):
+    """Give an imported mesh actor its per-vertex colours as direct RGB.
+
+    PyMOL writes cartoon/surface meshes with `colorPerVertex TRUE` and one
+    colour per vertex. `vtkVRMLImporter` turns that into a lookup table with
+    one entry per vertex, but leaves the mapper's scalar range at (0, 1) and
+    the index array inactive, so every vertex resolves to the same table
+    entry and `vtkGLTFExporter` writes the whole mesh in one colour. Copying
+    table entry i onto vertex i as a plain "Colors" array is the same form
+    the sphere and stick actors already use.
+    """
+    mapper = actor.GetMapper()
+    polydata = mapper.GetInput() if mapper is not None else None
+    table = mapper.GetLookupTable() if mapper is not None else None
+    if polydata is None or not isinstance(table, vtk.vtkLookupTable):
+        return
+    n_points = polydata.GetNumberOfPoints()
+    # Only the one-entry-per-vertex case is understood; anything else (a
+    # mesh with a single material colour has no such table) is left alone.
+    if n_points == 0 or table.GetNumberOfTableValues() != n_points:
+        return
+    polydata.GetPointData().AddArray(
+        _color_array(table.GetTableValue(i)[:3] for i in range(n_points))
+    )
+    actor.SetMapper(_direct_color_mapper(polydata))
+
+
 def load_actors(wrl_path):
     """Return the list of vtkActors baked into a PyMOL VRML2 export."""
     spheres, cylinders, leftover_text = parse_wrl(wrl_path)
@@ -174,6 +201,7 @@ def load_actors(wrl_path):
     # add them to a renderer of their own (VR window, desktop preview, ...).
     for actor in imported:
         renderer.RemoveActor(actor)
+        _bake_vertex_colors(actor)
     actors.extend(imported)
 
     os.remove(leftover_path)
