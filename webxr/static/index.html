@@ -140,14 +140,22 @@
       <input type="color" id="bg-color" value="#00004d" />
     </section>
     <section>
-      <h4>measure</h4>
-      <label class="rep-option"><input type="checkbox" id="measure-mode" /> click atoms to measure distance</label>
+      <h4>H-bonds (PyMOL polar contacts) &mdash; of the selection, or of everything</h4>
+      <label class="rep-option"><input type="checkbox" id="show-hbonds" /> show H-bonds</label>
+    </section>
+    <section>
+      <h4>pointer tool &mdash; what a click on the molecule does</h4>
+      <select id="tool-mode">
+        <option value="select">select residue</option>
+        <option value="distance">measure distance (2 atoms)</option>
+        <option value="angle">measure angle (3 atoms)</option>
+        <option value="dihedral">measure dihedral (4 atoms)</option>
+      </select>
       <div id="measure-hud" class="slow-hint">&nbsp;</div>
       <button id="clear-measurements" type="button">clear measurements</button>
     </section>
     <section>
       <h4>select residues</h4>
-      <label class="rep-option"><input type="checkbox" id="select-mode" /> click residues to select</label>
       <div id="selection-hud" class="slow-hint">nothing selected</div>
       <button id="toggle-sequence" type="button">show menu and sequence</button>
       <button id="select-all" type="button">select all</button>

@@ -58,10 +58,13 @@ def test_two_picks_produce_a_real_distance_measurement(live_server):
         pending_after = page.evaluate("() => window.vrPymolDebug.pendingAtom")
         assert pending_after is None
 
+        measured = page.evaluate("() => window.vrPymolDebug.measurements")
+        assert len(measured) == 1 and measured[0]["kind"] == "distance"
+        # drawn as 2 markers, 1 rod between them and 1 value label
         group_children = page.evaluate(
             "() => window.vrPymolDebug.measurementGroup.children.length"
         )
-        assert group_children == 3
+        assert group_children == 4
 
         hud_text = page.evaluate("() => window.vrPymolDebug.measureHud")
         assert "C1" in hud_text and "O2" in hud_text

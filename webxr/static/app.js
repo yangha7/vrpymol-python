@@ -97,9 +97,15 @@ function startNewModel(atoms) {
   grabbers.length = 0;
   twoHand = null;
   measurementGroup = null;
-  pendingAtom = null;
+  pendingPicks = [];
+  measurements = [];
+  measurementLabels = [];
+  hoverMarker = null;
+  hoverAtom = null;
   measureHud.textContent = " ";
   selectionMarkers = null;
+  hbondDashes = null;
+  shownHbonds.clear();
   currentModel = new THREE.Group();
   currentModel.name = "molecule";
   currentFit = fitToAtoms(atoms);
@@ -112,6 +118,11 @@ const shownByRep = new Map(); // rep -> Set of residue keys drawn in that rep
 const layers = new Map(); // rep -> {rep, state: "loading"|"ready"|"missing", root, parts}
 let staleLayers = []; // previous scene's layers, kept on screen until the new ones arrive
 let sceneRequestInFlight = false;
+// True from the moment a scene change (molecule, colouring, a setting) is
+// queued until its reload starts. Representation toggles made meanwhile are
+// remembered but fetch nothing: the layer they would fetch belongs to the
+// scene that is about to be replaced.
+let sceneChangePending = false;
 
 function disposeLayer(layer) {
   if (!layer.root) return;
@@ -414,7 +425,7 @@ function ensureLayers() {
   for (const rep of availableReps) {
     const layer = layers.get(rep);
     if (!layer) {
-      if (shownByRep.get(rep).size > 0) loadLayer(rep);
+      if (shownByRep.get(rep).size > 0 && !sceneChangePending) loadLayer(rep);
     } else if (layer.state === "ready") {
       applyLayerMask(layer);
     }
@@ -423,6 +434,7 @@ function ensureLayers() {
 }
 
 function representationChanged() {
+  pickableAtoms = null; // what a ray can pick follows what is drawn
   ensureLayers();
   syncRepControls();
   requestSequenceRedraw();
@@ -448,6 +460,7 @@ function hideEverything(residues) {
     for (const residue of residues) keys.delete(residue.key);
   }
   representationChanged();
+  if (shownHbonds.size > 0) setHbondsShown(residues, false);
 }
 
 // Reload the scene after the molecule, objects, frame, colouring or an
@@ -456,17 +469,16 @@ function hideEverything(residues) {
 let sceneEpoch = 0;
 async function syncScene() {
   const epoch = ++sceneEpoch;
+  sceneChangePending = false;
   staleLayers.push(...layers.values());
   layers.clear();
   let atoms;
   let objects;
   if (staticManifest) {
     const molecule = moleculeSelect.value;
-    staticAtoms = null; // never pick against the previous molecule's atoms
     atoms = await loadStaticAtoms(molecule);
     objects = { mol: molecule };
     if (epoch !== sceneEpoch) return;
-    staticAtoms = atoms;
   } else {
     const data = await (await fetch("/api/atoms")).json();
     if (epoch !== sceneEpoch || !data.ok) return; // a newer sync has taken over
@@ -478,6 +490,7 @@ async function syncScene() {
   }
   setSceneAtoms(atoms, objects);
   representationChanged();
+  refreshHbonds();
 }
 
 function resetView() {
@@ -663,32 +676,35 @@ function thumbstickY(session) {
   return y;
 }
 
-// --- click-to-measure ---
+// --- pointer tools: select, and measure distance / angle / dihedral ---
 //
-// Real per-atom picking without threading a custom atom-ID through the
-// batched glyph geometry/glTF export (a real risk not worth taking: the
-// mesh_loader pipeline already found vtkGLTFExporter silently drops things
-// it doesn't understand, e.g. vtkGlyph3DMapper actors export as empty).
-// Instead a raycast hit's *world* point is inverted back into the model's
-// own local space via `worldToLocal` -- glTF export bakes real absolute
-// PyMOL/PDB Angstrom coordinates straight into vertex positions with no
-// extra node transform in between, so this recovers real molecule-space
-// coordinates regardless of the model's current fit/grab/scale transform --
-// and the server (`/api/pick`) finds the real nearest atom from that point.
-//
-// Exclusive with orbit-drag rather than trying to distinguish a click from
-// a drag-release: toggling measure mode on disables OrbitControls, so every
-// click on the canvas is unambiguously a measurement pick.
+// One tool is active at a time and decides what the trigger (or a desktop
+// click) does on the molecule: "select" toggles a residue (further down),
+// the three measuring tools collect atoms -- 2, 3 or 4 -- and then draw the
+// measurement with its value. Everything is computed from the atom table in
+// the browser, so it works the same with the live server and the static
+// build; the numbers are the ones PyMOL's get_distance / get_angle /
+// get_dihedral give for the same atoms.
 
-const measureToggle = document.getElementById("measure-mode");
+const TOOL_ATOM_COUNT = { distance: 2, angle: 3, dihedral: 4 };
+const toolSelect = document.getElementById("tool-mode");
 const measureHud = document.getElementById("measure-hud");
 const clearMeasurementsButton = document.getElementById("clear-measurements");
 const MARKER_RADIUS = 0.3; // Angstroms -- small relative to a ~1.5A atom radius
+const MEASURE_LINE_RADIUS = 0.06; // Angstroms
 const PENDING_COLOR = 0xffee00;
 const DONE_COLOR = 0x00e5ff;
+const HOVER_COLOR = 0xffffff;
+const LABEL_HEIGHT = 0.022; // metres, whatever the zoom: labels stay readable
 
-let pendingAtom = null; // {index, name, resn, resi, coord, marker}
+let toolMode = "select";
+let pendingPicks = []; // [{atom, marker}] collected so far for the active tool
+let measurements = []; // [{kind, atoms, value, text}]
+let measurementLabels = []; // sprites, rescaled every frame to LABEL_HEIGHT
 let measurementGroup = null; // THREE.Group, child of currentModel
+let hoverAtom = null; // atom under a controller's ray while a measuring tool is active
+let hoverMarker = null;
+let pickableAtoms = null; // [{atom, radius}] built on demand, see getPickableAtoms
 
 function ensureMeasurementGroup() {
   if (!currentModel) return null;
@@ -700,129 +716,137 @@ function ensureMeasurementGroup() {
   return measurementGroup;
 }
 
+// depthTest off + high renderOrder throughout: a marker at an atom's exact
+// centre is otherwise hidden inside that atom's own sphere, and a line
+// between two atoms runs straight through the molecule. Real PyMOL draws
+// its own selection indicators and measurement dashes the same way.
+function overlayMaterial(color) {
+  return new THREE.MeshBasicMaterial({ color, depthTest: false });
+}
+
 function addMarker(coord, color) {
-  const group = ensureMeasurementGroup();
-  const geometry = new THREE.SphereGeometry(MARKER_RADIUS, 12, 12);
-  // depthTest off + high renderOrder: a marker at an atom's exact center is
-  // otherwise always fully enclosed by (and invisible inside) that atom's
-  // own much larger sphere, regardless of camera angle. Real PyMOL's own
-  // selection indicators are small dots drawn the same way -- ignoring the
-  // depth buffer so they show through solid geometry -- not a workaround
-  // invented for this project.
-  const material = new THREE.MeshBasicMaterial({ color, depthTest: false });
-  const marker = new THREE.Mesh(geometry, material);
-  marker.position.set(coord[0], coord[1], coord[2]);
+  const marker = new THREE.Mesh(new THREE.SphereGeometry(MARKER_RADIUS, 12, 12), overlayMaterial(color));
+  marker.position.fromArray(coord);
   marker.renderOrder = 999;
-  group.add(marker);
+  marker.raycast = () => {}; // never the thing a pointing ray hits
+  ensureMeasurementGroup().add(marker);
   return marker;
 }
 
-function addLine(coordA, coordB) {
-  const group = ensureMeasurementGroup();
-  const geometry = new THREE.BufferGeometry().setFromPoints([
-    new THREE.Vector3(...coordA),
-    new THREE.Vector3(...coordB),
-  ]);
-  // Same depthTest-off reasoning as addMarker -- a line between two atom
-  // centers otherwise runs straight through the molecule's own opaque
-  // geometry and would be mostly hidden.
-  const material = new THREE.LineBasicMaterial({ color: DONE_COLOR, depthTest: false });
-  const line = new THREE.Line(geometry, material);
-  line.renderOrder = 999;
-  group.add(line);
-  return line;
+function addRod(coordA, coordB) {
+  const a = new THREE.Vector3().fromArray(coordA);
+  const b = new THREE.Vector3().fromArray(coordB);
+  const rod = new THREE.Mesh(
+    new THREE.CylinderGeometry(MEASURE_LINE_RADIUS, MEASURE_LINE_RADIUS, a.distanceTo(b), 6, 1, true),
+    overlayMaterial(DONE_COLOR),
+  );
+  rod.position.addVectors(a, b).multiplyScalar(0.5);
+  // a cylinder's axis is +Y; turn it onto the a -> b direction
+  rod.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), b.sub(a).normalize());
+  rod.renderOrder = 999;
+  rod.raycast = () => {};
+  ensureMeasurementGroup().add(rod);
+  return rod;
+}
+
+function addLabel(text, coord) {
+  const canvas = document.createElement("canvas");
+  canvas.width = 256;
+  canvas.height = 64;
+  const ctx = canvas.getContext("2d");
+  ctx.font = "bold 40px monospace";
+  const width = Math.min(250, ctx.measureText(text).width + 24);
+  ctx.fillStyle = "rgba(0, 0, 0, 0.7)";
+  ctx.fillRect((256 - width) / 2, 4, width, 56);
+  ctx.fillStyle = "#ffffff";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(text, 128, 34, 240);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  const label = new THREE.Sprite(
+    new THREE.SpriteMaterial({ map: texture, depthTest: false, transparent: true }),
+  );
+  label.position.fromArray(coord);
+  label.renderOrder = 1000;
+  label.raycast = () => {};
+  ensureMeasurementGroup().add(label);
+  measurementLabels.push(label);
+  return label;
+}
+
+// Labels live in the model's frame (Angstroms) so they ride along with it,
+// but are held at a fixed real-world size so zooming out doesn't shrink
+// them to nothing.
+function updateLabelScales() {
+  if (measurementLabels.length === 0 || !currentModel) return;
+  const height = LABEL_HEIGHT / currentModel.getWorldScale(new THREE.Vector3()).x;
+  for (const label of measurementLabels) label.scale.set(height * 4, height, 1);
 }
 
 function describeAtom(atom) {
   return `${atom.name} (${atom.resn}${atom.resi}${atom.chain ? "/" + atom.chain : ""})`;
 }
 
-async function fetchDistance(a, b) {
-  if (staticManifest) {
-    // Same quantity real PyMOL's cmd.get_distance returns for two atoms:
-    // plain Euclidean distance between their coordinates.
-    const distance = Math.hypot(
-      a.coord[0] - b.coord[0],
-      a.coord[1] - b.coord[1],
-      a.coord[2] - b.coord[2],
-    );
-    measureHud.textContent = `${describeAtom(a)} ↔ ${describeAtom(b)}: ${distance.toFixed(2)} Å`;
-    return;
-  }
-  const response = await fetch(`/api/distance?atom1=${a.index}&atom2=${b.index}`);
-  const data = await response.json();
-  if (!data.ok) {
-    measureHud.textContent = `distance lookup failed: ${data.error}`;
-    return;
-  }
-  measureHud.textContent = `${describeAtom(a)} ↔ ${describeAtom(b)}: ${data.distance.toFixed(2)} Å`;
+// Distance in Angstroms, angle (at the middle atom) and dihedral in degrees.
+// The dihedral follows the IUPAC sign convention, as PyMOL's get_dihedral.
+function measureValue(kind, atoms) {
+  const [a, b, c, d] = atoms.map((atom) => new THREE.Vector3().fromArray(atom.coord));
+  if (kind === "distance") return a.distanceTo(b);
+  if (kind === "angle") return THREE.MathUtils.radToDeg(a.sub(b).angleTo(c.sub(b)));
+  const b1 = b.clone().sub(a);
+  const b2 = c.clone().sub(b);
+  const b3 = d.clone().sub(c);
+  const n1 = b1.clone().cross(b2);
+  const n2 = b2.clone().cross(b3);
+  return THREE.MathUtils.radToDeg(Math.atan2(b2.length() * b1.dot(n2), n1.dot(n2)));
 }
 
-function handlePickedAtom(atom) {
-  if (pendingAtom && pendingAtom.index === atom.index) {
-    measureHud.textContent = `${describeAtom(atom)} selected -- click a different atom to measure`;
-    return;
-  }
-  if (!pendingAtom) {
-    const marker = addMarker(atom.coord, PENDING_COLOR);
-    pendingAtom = { ...atom, marker };
-    measureHud.textContent = `${describeAtom(atom)} selected -- click a second atom`;
-    return;
-  }
-  pendingAtom.marker.material.color.setHex(DONE_COLOR);
-  addMarker(atom.coord, DONE_COLOR);
-  addLine(pendingAtom.coord, atom.coord);
-  fetchDistance(pendingAtom, atom);
-  pendingAtom = null;
-}
-
-// Static mode's stand-in for /api/pick: same nearest-atom search, over the
-// real PyMOL atom table baked alongside the molecule (webxr/bake_static.py).
-function pickNearestBakedAtom(x, y, z) {
-  if (!staticAtoms || staticAtoms.length === 0) {
-    return { ok: false, error: "atom table not loaded yet" };
-  }
-  let best = null;
-  let bestDist = Infinity;
-  for (const atom of staticAtoms) {
-    const [ax, ay, az] = atom.coord;
-    const dist = (ax - x) ** 2 + (ay - y) ** 2 + (az - z) ** 2;
-    if (dist < bestDist) {
-      best = atom;
-      bestDist = dist;
-    }
-  }
-  return { ok: true, ...best };
-}
-
-async function pickLocalPoint(x, y, z) {
-  let atom;
-  if (staticManifest) {
-    atom = pickNearestBakedAtom(x, y, z);
+function completeMeasurement(kind, picks) {
+  const atoms = picks.map((pick) => pick.atom);
+  const value = measureValue(kind, atoms);
+  const text = kind === "distance" ? `${value.toFixed(2)} Å` : `${value.toFixed(1)}°`;
+  picks.forEach((pick) => pick.marker.material.color.setHex(DONE_COLOR));
+  for (let i = 0; i + 1 < atoms.length; i++) addRod(atoms[i].coord, atoms[i + 1].coord);
+  // the label sits where the quantity lives: mid-bond for a distance, on
+  // the middle atom for an angle, on the central bond for a dihedral
+  const anchor = new THREE.Vector3();
+  if (kind === "angle") {
+    anchor.fromArray(atoms[1].coord);
   } else {
-    const response = await fetch(`/api/pick?x=${x}&y=${y}&z=${z}`);
-    atom = await response.json();
+    const [p, q] = kind === "distance" ? atoms : [atoms[1], atoms[2]];
+    anchor.fromArray(p.coord).add(new THREE.Vector3().fromArray(q.coord)).multiplyScalar(0.5);
   }
-  if (!atom.ok) {
-    measureHud.textContent = `pick failed: ${atom.error}`;
-    return null;
-  }
-  handlePickedAtom(atom);
-  return atom;
+  addLabel(text, anchor.toArray());
+  measurements.push({ kind, atoms, value, text });
+  measureHud.textContent = `${atoms.map(describeAtom).join(" – ")}: ${text}`;
+  requestSequenceRedraw();
 }
 
-function onCanvasClick(event) {
-  if (!measureToggle.checked || !currentModel) return;
-  const rect = renderer.domElement.getBoundingClientRect();
-  const ndc = new THREE.Vector2(
-    ((event.clientX - rect.left) / rect.width) * 2 - 1,
-    -((event.clientY - rect.top) / rect.height) * 2 + 1,
-  );
-  raycaster.setFromCamera(ndc, camera);
-  const hits = raycaster.intersectObject(currentModel, true);
-  if (hits.length === 0) return;
-  const localPoint = currentModel.worldToLocal(hits[0].point.clone());
-  pickLocalPoint(localPoint.x, localPoint.y, localPoint.z);
+// Feed one atom to the active measuring tool.
+function addPick(atom) {
+  const kind = TOOL_ATOM_COUNT[toolMode] ? toolMode : "distance";
+  if (pendingPicks.some((pick) => pick.atom === atom)) {
+    measureHud.textContent = `${describeAtom(atom)} is already picked -- pick a different atom`;
+    return;
+  }
+  pendingPicks.push({ atom, marker: addMarker(atom.coord, PENDING_COLOR) });
+  const needed = TOOL_ATOM_COUNT[kind];
+  if (pendingPicks.length === needed) {
+    const picks = pendingPicks;
+    pendingPicks = [];
+    completeMeasurement(kind, picks);
+  } else {
+    measureHud.textContent =
+      `${kind}: ${pendingPicks.map((pick) => describeAtom(pick.atom)).join(" – ")}` +
+      ` -- pick atom ${pendingPicks.length + 1} of ${needed}`;
+    requestSequenceRedraw();
+  }
+}
+
+function dropPendingPicks() {
+  for (const pick of pendingPicks) pick.marker.parent?.remove(pick.marker);
+  pendingPicks = [];
 }
 
 function clearMeasurements() {
@@ -830,19 +854,224 @@ function clearMeasurements() {
     measurementGroup.parent?.remove(measurementGroup);
     measurementGroup = null;
   }
-  pendingAtom = null;
-  measureHud.textContent = " ";
+  pendingPicks = [];
+  measurements = [];
+  measurementLabels = [];
+  hoverMarker = null;
+  measureHud.textContent = " ";
+  requestSequenceRedraw();
 }
 
-renderer.domElement.addEventListener("click", onCanvasClick);
-measureToggle.addEventListener("change", () => {
-  controls.enabled = !measureToggle.checked;
-  if (!measureToggle.checked && pendingAtom) {
-    pendingAtom.marker.material.color.setHex(DONE_COLOR);
-    pendingAtom = null;
+function setTool(mode) {
+  if (mode === toolMode) return;
+  toolMode = mode;
+  toolSelect.value = mode;
+  dropPendingPicks(); // half a distance can't be finished as an angle
+  setHoverAtom(null);
+  measureHud.textContent = TOOL_ATOM_COUNT[mode] ? `${mode}: pick ${TOOL_ATOM_COUNT[mode]} atoms` : " ";
+  requestSequenceRedraw();
+}
+
+// Atoms a ray can pick, each with the radius it presents: its sphere when
+// drawn as spheres, a slim target on sticks and lines, and for residues
+// drawn only as cartoon just the C-alpha -- so the ray picks what can be
+// seen, never an atom of a hidden residue.
+function getPickableAtoms() {
+  if (pickableAtoms) return pickableAtoms;
+  const sphereScale = Number(document.getElementById("sphere-scale").value) || 1;
+  const shown = (rep, residue) => shownByRep.get(rep)?.has(residue.key);
+  pickableAtoms = [];
+  for (const residue of allResidues) {
+    const reps = availableReps.filter((rep) => shown(rep, residue));
+    if (reps.length === 0) continue;
+    const backboneOnly = reps.every((rep) => rep === "cartoon" || rep === "ribbon");
+    const hasAlphaCarbon = residue.atoms.some((atom) => atom.name === "CA");
+    for (const atom of residue.atoms) {
+      if (backboneOnly && hasAlphaCarbon && atom.name !== "CA") continue;
+      let radius = backboneOnly ? 1.5 : 0.7;
+      if (reps.includes("spheres") || reps.includes("surface")) {
+        radius = (VDW_RADIUS[atom.element] || VDW_DEFAULT) * sphereScale;
+      }
+      pickableAtoms.push({ atom, radius });
+    }
   }
-});
+  return pickableAtoms;
+}
+
+// The first pickable atom a world-space ray runs into, or null.
+function atomOnRay(origin, direction) {
+  if (!currentModel) return null;
+  const toModel = currentModel.matrixWorld.clone().invert();
+  const start = origin.clone().applyMatrix4(toModel);
+  const along = origin.clone().add(direction).applyMatrix4(toModel).sub(start).normalize();
+  let best = null;
+  let bestEntry = Infinity;
+  for (const { atom, radius } of getPickableAtoms()) {
+    const dx = atom.coord[0] - start.x;
+    const dy = atom.coord[1] - start.y;
+    const dz = atom.coord[2] - start.z;
+    const t = dx * along.x + dy * along.y + dz * along.z; // closest approach along the ray
+    if (t <= 0) continue;
+    const miss2 = dx * dx + dy * dy + dz * dz - t * t;
+    if (miss2 > radius * radius) continue;
+    const entry = t - Math.sqrt(radius * radius - miss2); // where the ray enters its sphere
+    if (entry < bestEntry) {
+      best = atom;
+      bestEntry = entry;
+    }
+  }
+  return best;
+}
+
+function atomUnderController(controller) {
+  const origin = new THREE.Vector3().setFromMatrixPosition(controller.matrixWorld);
+  const direction = new THREE.Vector3(0, 0, -1).transformDirection(controller.matrixWorld);
+  return atomOnRay(origin, direction);
+}
+
+function setHoverAtom(atom) {
+  if (atom === hoverAtom) return;
+  hoverAtom = atom;
+  if (atom) {
+    if (!hoverMarker || hoverMarker.parent !== ensureMeasurementGroup()) {
+      hoverMarker = addMarker(atom.coord, HOVER_COLOR);
+    }
+    hoverMarker.position.fromArray(atom.coord);
+    hoverMarker.visible = true;
+  } else if (hoverMarker) {
+    hoverMarker.visible = false;
+  }
+  requestSequenceRedraw();
+}
+
+// While a measuring tool is active, show which atom the trigger would pick.
+function updateToolHover() {
+  if (!TOOL_ATOM_COUNT[toolMode]) return;
+  let atom = null;
+  for (const controller of controllers) {
+    if (panelItemAt(controller) !== undefined) continue; // pointing at the menu
+    atom = atom || atomUnderController(controller);
+  }
+  setHoverAtom(atom);
+}
+
+toolSelect.addEventListener("change", () => setTool(toolSelect.value));
 clearMeasurementsButton.addEventListener("click", clearMeasurements);
+
+// --- H-bonds (polar contacts) ---
+//
+// Which atom pairs are hydrogen bonded is PyMOL's call, not the browser's:
+// the pairs come from PyMOL's own finder (`/api/hbonds`, or a file baked
+// per molecule for the static build). The browser only decides which of
+// them to draw: "show" adds every bond with an end in the target residues,
+// "hide" removes them, following the same selection-or-everything rule as
+// the representations.
+
+const hbondCheckbox = document.getElementById("show-hbonds");
+const HBOND_COLOR = 0xffe14d;
+const HBOND_RADIUS = 0.07; // Angstroms
+const HBOND_DASH = 0.35; // dash and gap length, Angstroms
+const HBOND_GEOMETRY = new THREE.CylinderGeometry(HBOND_RADIUS, HBOND_RADIUS, 1, 6, 1, false);
+const HBOND_MATERIAL = new THREE.MeshBasicMaterial({ color: HBOND_COLOR });
+
+let hbondPairs = null; // [{key, a, b}] for the current scene; null until fetched
+const shownHbonds = new Set(); // keys of the pairs currently drawn
+let hbondDashes = null; // THREE.InstancedMesh, child of currentModel
+
+async function loadHbondPairs() {
+  if (hbondPairs) return hbondPairs;
+  const epoch = sceneEpoch;
+  const url = staticManifest ? staticManifest.hbonds?.[sceneObjects.mol] : "/api/hbonds";
+  if (!url) {
+    hud.textContent = "H-bonds are not available in this build";
+    return [];
+  }
+  const data = await (await fetch(url)).json();
+  if (epoch !== sceneEpoch) return []; // the scene changed while this was in flight
+  const atomByIndex = new Map(sceneAtoms.map((atom) => [`${atom.object}|${atom.index}`, atom]));
+  hbondPairs = (staticManifest ? data : data.pairs)
+    .map(([objectA, indexA, objectB, indexB]) => ({
+      key: `${objectA}|${indexA}|${objectB}|${indexB}`,
+      a: atomByIndex.get(`${objectA}|${indexA}`),
+      b: atomByIndex.get(`${objectB}|${indexB}`),
+    }))
+    .filter((pair) => pair.a && pair.b);
+  return hbondPairs;
+}
+
+function rebuildHbondDashes() {
+  if (hbondDashes) {
+    hbondDashes.parent?.remove(hbondDashes);
+    hbondDashes.dispose();
+    hbondDashes = null;
+  }
+  const pairs = (hbondPairs || []).filter((pair) => shownHbonds.has(pair.key));
+  if (!currentModel || pairs.length === 0) return;
+  const matrices = [];
+  const up = new THREE.Vector3(0, 1, 0);
+  const a = new THREE.Vector3();
+  const b = new THREE.Vector3();
+  const direction = new THREE.Vector3();
+  const turn = new THREE.Quaternion();
+  const size = new THREE.Vector3(1, HBOND_DASH, 1);
+  for (const pair of pairs) {
+    a.fromArray(pair.a.coord);
+    b.fromArray(pair.b.coord);
+    const length = a.distanceTo(b);
+    direction.subVectors(b, a).normalize();
+    turn.setFromUnitVectors(up, direction);
+    // dashes centred on the bond, so both ends look the same
+    const count = Math.max(1, Math.round(length / (2 * HBOND_DASH)));
+    const first = (length - (2 * count - 1) * HBOND_DASH) / 2 + HBOND_DASH / 2;
+    for (let i = 0; i < count; i++) {
+      const centre = a.clone().addScaledVector(direction, first + 2 * i * HBOND_DASH);
+      matrices.push(new THREE.Matrix4().compose(centre, turn, size));
+    }
+  }
+  hbondDashes = new THREE.InstancedMesh(HBOND_GEOMETRY, HBOND_MATERIAL, matrices.length);
+  matrices.forEach((matrix, i) => hbondDashes.setMatrixAt(i, matrix));
+  hbondDashes.name = "hbonds";
+  hbondDashes.frustumCulled = false;
+  hbondDashes.raycast = () => {};
+  currentModel.add(hbondDashes);
+}
+
+function syncHbondControl() {
+  const total = hbondPairs ? hbondPairs.length : 0;
+  hbondCheckbox.checked = shownHbonds.size > 0;
+  hbondCheckbox.indeterminate = shownHbonds.size > 0 && shownHbonds.size < total;
+}
+
+async function setHbondsShown(residues, shown) {
+  const pairs = await loadHbondPairs();
+  const keys = new Set(residues.map((residue) => residue.key));
+  for (const pair of pairs) {
+    if (!keys.has(residueKey(pair.a)) && !keys.has(residueKey(pair.b))) continue;
+    if (shown) shownHbonds.add(pair.key);
+    else shownHbonds.delete(pair.key);
+  }
+  rebuildHbondDashes();
+  syncHbondControl();
+  requestSequenceRedraw();
+}
+
+// After the scene reloaded: the pair list is refetched (objects and frames
+// move atoms) and bonds that no longer exist are dropped.
+async function refreshHbonds() {
+  hbondPairs = null;
+  if (shownHbonds.size > 0) {
+    const current = new Set((await loadHbondPairs()).map((pair) => pair.key));
+    for (const key of Array.from(shownHbonds)) {
+      if (!current.has(key)) shownHbonds.delete(key);
+    }
+  }
+  rebuildHbondDashes();
+  syncHbondControl();
+}
+
+hbondCheckbox.addEventListener("change", () => {
+  setHbondsShown(targetResidues(), hbondCheckbox.checked);
+});
 
 // --- residue selection: by pointing, and by sequence ---
 //
@@ -861,7 +1090,6 @@ const ONE_LETTER = {
 };
 const WATER_NAMES = new Set(["HOH", "WAT", "H2O", "DOD"]);
 
-const selectToggle = document.getElementById("select-mode");
 const selectionHud = document.getElementById("selection-hud");
 const clearSelectionButton = document.getElementById("clear-selection");
 const toggleSequenceButton = document.getElementById("toggle-sequence");
@@ -1097,14 +1325,14 @@ function selectWorldPoint(point) {
   return selectLocalPoint(local.x, local.y, local.z);
 }
 
-// Desktop: a click selects, a drag still orbits -- told apart by how far the
-// pointer travelled, so select mode doesn't have to switch orbiting off.
+// Desktop: a click uses the active tool, a drag still orbits -- told apart
+// by how far the pointer travelled, so no tool has to switch orbiting off.
 let pointerDownAt = null;
 renderer.domElement.addEventListener("pointerdown", (event) => {
   pointerDownAt = [event.clientX, event.clientY];
 });
 renderer.domElement.addEventListener("click", (event) => {
-  if (!selectToggle.checked || !currentModel || !pointerDownAt) return;
+  if (!currentModel || !pointerDownAt) return;
   if (Math.hypot(event.clientX - pointerDownAt[0], event.clientY - pointerDownAt[1]) > 5) return;
   const rect = renderer.domElement.getBoundingClientRect();
   const ndc = new THREE.Vector2(
@@ -1112,15 +1340,13 @@ renderer.domElement.addEventListener("click", (event) => {
     -((event.clientY - rect.top) / rect.height) * 2 + 1,
   );
   raycaster.setFromCamera(ndc, camera);
+  if (TOOL_ATOM_COUNT[toolMode]) {
+    const atom = atomOnRay(raycaster.ray.origin, raycaster.ray.direction);
+    if (atom) addPick(atom);
+    return;
+  }
   const hits = raycaster.intersectObject(currentModel, true);
   if (hits.length > 0) selectWorldPoint(hits[0].point);
-});
-// One click can't mean both "measure" and "select".
-selectToggle.addEventListener("change", () => {
-  if (selectToggle.checked && measureToggle.checked) measureToggle.click();
-});
-measureToggle.addEventListener("change", () => {
-  if (measureToggle.checked) selectToggle.checked = false;
 });
 clearSelectionButton.addEventListener("click", clearSelection);
 document.getElementById("select-all").addEventListener("click", () => {
@@ -1143,10 +1369,11 @@ const SEQ_PAD = 14;
 const SEQ_ROW_SHOW = 76; // top of each button row
 const SEQ_ROW_HIDE = 114;
 const SEQ_ROW_SELECT = 152;
+const SEQ_ROW_TOOL = 190;
 const SEQ_ROW_HEIGHT = 32;
 const SEQ_ROW_LABEL = 70; // width of the "show"/"hide"/"select" labels
 const SEQ_BUTTON_GAP = 6;
-const SEQ_HEADER = 204; // where the sequence starts
+const SEQ_HEADER = 242; // where the sequence starts
 const SEQ_GUTTER = 84;
 // No scrolling in VR, so long sequences get more (smaller) letters per row
 // until the whole thing fits on one board.
@@ -1218,12 +1445,12 @@ function layoutSequenceWith(columns) {
   return { layout: { height: y + SEQ_PAD, cellW, cellH, tickSize, labels, ticks }, items };
 }
 
-// The button rows: show and hide per representation (PyMOL's S and H
-// menus), then the selection helpers.
+// The button rows: show and hide per representation and for H-bonds
+// (PyMOL's S and H menus), the selection helpers, then the pointer tool.
 function menuButtons() {
   const items = [];
   const left = SEQ_PAD + SEQ_ROW_LABEL;
-  const slots = availableReps.length + 1; // the hide row has one extra: "everything"
+  const slots = availableReps.length + 2; // plus "h-bonds", and "everything" on the hide row
   const width = (SEQ_WIDTH - SEQ_PAD - left + SEQ_BUTTON_GAP) / slots - SEQ_BUTTON_GAP;
   const button = (slot, y, w, action) => ({
     x: left + slot * (w + SEQ_BUTTON_GAP),
@@ -1236,7 +1463,20 @@ function menuButtons() {
     items.push(button(i, SEQ_ROW_SHOW, width, { kind: "show", rep, label: rep }));
     items.push(button(i, SEQ_ROW_HIDE, width, { kind: "hide", rep, label: rep }));
   });
-  items.push(button(availableReps.length, SEQ_ROW_HIDE, width, { kind: "hideAll", label: "everything" }));
+  const n = availableReps.length;
+  items.push(button(n, SEQ_ROW_SHOW, width, { kind: "showHbonds", label: "h-bonds" }));
+  items.push(button(n, SEQ_ROW_HIDE, width, { kind: "hideHbonds", label: "h-bonds" }));
+  items.push(button(n + 1, SEQ_ROW_HIDE, width, { kind: "hideAll", label: "everything" }));
+  ["select", "distance", "angle", "dihedral"].forEach((tool, i) => {
+    items.push(button(i, SEQ_ROW_TOOL, 110, { kind: "tool", tool, label: tool }));
+  });
+  items.push({
+    x: left + 4 * (110 + SEQ_BUTTON_GAP) + 20,
+    y: SEQ_ROW_TOOL,
+    w: 230,
+    h: SEQ_ROW_HEIGHT,
+    action: { kind: "clearMeasurements", label: "clear measurements" },
+  });
   ["selectAll", "invert", "clear"].forEach((kind, i) => {
     const label = { selectAll: "all", invert: "invert", clear: "none" }[kind];
     items.push(button(i, SEQ_ROW_SELECT, 110, { kind, label }));
@@ -1257,6 +1497,16 @@ function describeAction(action) {
       return `hide ${action.rep} of ${describeTarget()}`;
     case "hideAll":
       return `hide ${describeTarget()} completely`;
+    case "showHbonds":
+      return `show H-bonds of ${describeTarget()}`;
+    case "hideHbonds":
+      return `hide H-bonds of ${describeTarget()}`;
+    case "tool":
+      return action.tool === "select"
+        ? "trigger on the molecule selects a residue"
+        : `trigger on the molecule picks ${TOOL_ATOM_COUNT[action.tool]} atoms to measure a ${action.tool}`;
+    case "clearMeasurements":
+      return "remove every measurement";
     case "selectAll":
       return "select every residue";
     case "invert":
@@ -1276,6 +1526,18 @@ function runMenuAction(action) {
       break;
     case "hideAll":
       hideEverything(targetResidues());
+      break;
+    case "showHbonds":
+      setHbondsShown(targetResidues(), true);
+      break;
+    case "hideHbonds":
+      setHbondsShown(targetResidues(), false);
+      break;
+    case "tool":
+      setTool(action.tool);
+      break;
+    case "clearMeasurements":
+      clearMeasurements();
       break;
     case "selectAll":
       setResiduesSelected(allResidues, true);
@@ -1331,13 +1593,19 @@ function drawSequence() {
   if (seqHover?.residue) status = describeResidue(seqHover.residue);
   else if (seqHover?.action) status = describeAction(seqHover.action);
   else if (anyLayerLoading()) status = "loading ...";
+  else if (TOOL_ATOM_COUNT[toolMode]) {
+    // while measuring: the atom the trigger would pick, else progress so far
+    status = hoverAtom
+      ? `${describeAtom(hoverAtom)} -- atom ${pendingPicks.length + 1} of ${TOOL_ATOM_COUNT[toolMode]}`
+      : measureHud.textContent.trim() || `${toolMode}: pick ${TOOL_ATOM_COUNT[toolMode]} atoms`;
+  }
   else if (sequenceResidues.length === 0) status = "no sequence loaded";
   else status = `${count} residue${count === 1 ? "" : "s"} selected`;
-  ctx.fillText(status, SEQ_PAD + 150, 28);
+  ctx.fillText(status, SEQ_PAD + 150, 28, SEQ_WIDTH - 2 * SEQ_PAD - 150);
   ctx.font = "14px monospace";
   ctx.fillStyle = "#9aa6cc";
   ctx.fillText(
-    "trigger: press a button or a residue, sweep for a range | grip: grab | stick: zoom | A/B: hide this window",
+    "trigger: use the tool on the molecule, press a button or residue here | grip: grab | stick: zoom | A/B: hide",
     SEQ_PAD,
     56,
   );
@@ -1348,6 +1616,7 @@ function drawSequence() {
   ctx.fillText("show", SEQ_PAD, SEQ_ROW_SHOW + rowMiddle);
   ctx.fillText("hide", SEQ_PAD, SEQ_ROW_HIDE + rowMiddle);
   ctx.fillText("select", SEQ_PAD, SEQ_ROW_SELECT + rowMiddle);
+  ctx.fillText("tool", SEQ_PAD, SEQ_ROW_TOOL + rowMiddle);
   ctx.fillStyle = "#9aa6cc";
   ctx.fillText(
     `show and hide act on ${describeTarget()}`,
@@ -1370,8 +1639,10 @@ function drawSequence() {
     if (item.action) {
       // a "show" button is lit while any of the target is drawn that way
       const lit =
-        item.action.kind === "show" &&
-        target.some((residue) => shownByRep.get(item.action.rep).has(residue.key));
+        (item.action.kind === "show" &&
+          target.some((residue) => shownByRep.get(item.action.rep).has(residue.key))) ||
+        (item.action.kind === "showHbonds" && shownHbonds.size > 0) ||
+        (item.action.kind === "tool" && item.action.tool === toolMode);
       ctx.fillStyle = item === seqHover ? "#5a6a9a" : lit ? "#2f7d5b" : "#2a3558";
       ctx.fillRect(item.x, item.y, item.w, item.h);
       ctx.fillStyle = "#ffffff";
@@ -1550,13 +1821,19 @@ function placePanelOnEnteringVr() {
 
 // --- trigger: select ---
 //
-// On the sequence board the trigger presses whatever the ray is on;
-// otherwise it selects the residue the ray hits on the molecule.
+// On the menu board the trigger presses whatever the ray is on; on the
+// molecule it uses the active tool: select the residue the ray hits, or
+// pick the atom under the ray for a measurement.
 function onTriggerStart(event) {
   const controller = event.target;
   const item = panelItemAt(controller);
   if (item !== undefined) {
     sequencePointerDown(item, controller);
+    return;
+  }
+  if (TOOL_ATOM_COUNT[toolMode]) {
+    const atom = atomUnderController(controller);
+    if (atom) addPick(atom);
     return;
   }
   const hit = controllerModelHit(controller);
@@ -1593,6 +1870,8 @@ renderer.setAnimationLoop((time) => {
     placePanelOnEnteringVr();
   }
   updatePanelPointers();
+  updateToolHover();
+  updateLabelScales();
   if (seqDirty) drawSequence();
   renderer.render(scene, camera);
 });
@@ -1629,7 +1908,9 @@ window.vrPymolDebug = {
   },
   // where a menu button is drawn, in the same form as sequenceCell
   menuButton(kind, rep) {
-    const item = seqItems.find((it) => it.action && it.action.kind === kind && it.action.rep === rep);
+    const item = seqItems.find(
+      (it) => it.action && it.action.kind === kind && (it.action.rep ?? it.action.tool) === rep,
+    );
     const u = (item.x + item.w / 2) / SEQ_WIDTH;
     const v = (item.y + item.h / 2) / seqLayout.height;
     seqPanel.updateMatrixWorld(true);
@@ -1675,19 +1956,53 @@ window.vrPymolDebug = {
   get zoomPivot() {
     return currentModel.localToWorld(currentFit.center.clone()).toArray();
   },
-  // deterministic measurement testing, bypassing real mouse-event/raycast
-  // coordinate math (which real clicks still exercise via onCanvasClick):
-  // tests can pass known real PyMOL atom-space coordinates directly.
-  pickLocalPoint,
+  // Deterministic measurement testing without raycasts: feed the active
+  // measuring tool the atom nearest a point given in real atom coordinates.
+  pickLocalPoint(x, y, z) {
+    const atom = nearestAtom(getAtomGrids().all, x, y, z);
+    if (!atom) return { ok: false, error: "no atoms loaded" };
+    addPick(atom);
+    return { ok: true, ...atom };
+  },
+  // what a controller's ray would pick right now, as "NAME (RESN123/A)"
+  atomUnderController(i) {
+    const atom = atomUnderController(controllers[i]);
+    return atom ? describeAtom(atom) : null;
+  },
+  setTool,
   clearMeasurements,
+  get tool() {
+    return toolMode;
+  },
   get measureHud() {
     return measureHud.textContent;
   },
   get pendingAtom() {
-    return pendingAtom ? { ...pendingAtom, marker: undefined } : null;
+    return pendingPicks.length > 0 ? pendingPicks[0].atom : null;
+  },
+  get measurements() {
+    return measurements.map((m) => ({
+      kind: m.kind,
+      value: m.value,
+      text: m.text,
+      atoms: m.atoms.map(describeAtom),
+    }));
   },
   get measurementGroup() {
     return measurementGroup;
+  },
+  // H-bonds of the selection (or everything); both return a promise
+  showHbonds: () => setHbondsShown(targetResidues(), true),
+  hideHbonds: () => setHbondsShown(targetResidues(), false),
+  get hbonds() {
+    return {
+      pairs: hbondPairs ? hbondPairs.length : null,
+      shown: shownHbonds.size,
+      dashes: hbondDashes ? hbondDashes.count : 0,
+      shownPairs: (hbondPairs || [])
+        .filter((pair) => shownHbonds.has(pair.key))
+        .map((pair) => [describeAtom(pair.a), describeAtom(pair.b)]),
+    };
   },
   addObject,
   removeObject,
@@ -1878,6 +2193,7 @@ frameSlider.addEventListener("input", () => {
 frameSlider.addEventListener("change", scheduleApplySelection);
 
 function scheduleApplySelection() {
+  sceneChangePending = true;
   hud.textContent = "queued...";
   clearTimeout(debounceTimer);
   debounceTimer = setTimeout(applySelection, APPLY_DEBOUNCE_MS);
@@ -1893,7 +2209,6 @@ function scheduleApplySelection() {
 // stay visible: the baked representations, color scheme, background,
 // selection, measure, reset view.
 let staticManifest = null;
-let staticAtoms = null;
 const staticAtomCache = new Map();
 
 // bake_static.py marks its copy of index.html with this meta tag, so the
@@ -1968,7 +2283,8 @@ async function applySelection() {
   } catch (error) {
     if (error.name === "AbortError") return; // superseded by a newer request
     sceneRequestInFlight = false;
-    refreshBusy();
+    sceneChangePending = false;
+    ensureLayers(); // the scene stays as it was: fetch what was held back
     hud.textContent = `failed to switch: ${error}`;
     return;
   }
@@ -1978,6 +2294,8 @@ async function applySelection() {
   sceneRequestInFlight = false;
   refreshBusy();
   if (!response.ok) {
+    sceneChangePending = false;
+    ensureLayers();
     hud.textContent = `failed to switch: ${response.status}`;
     return;
   }

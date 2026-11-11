@@ -56,6 +56,7 @@ def bake(out_dir, molecules=MOLECULES, reps=REPS, colors=COLORS):
         f.write(html)
     baked_dir = os.path.join(out_dir, "baked")
     os.makedirs(os.path.join(baked_dir, "atoms"))
+    os.makedirs(os.path.join(baked_dir, "hbonds"))
     # Pages runs Jekyll by default, which skips some paths; nothing here needs it.
     open(os.path.join(out_dir, ".nojekyll"), "w").close()
 
@@ -80,6 +81,8 @@ def bake(out_dir, molecules=MOLECULES, reps=REPS, colors=COLORS):
         atoms = server.atom_table(server._get_session())
         with open(os.path.join(baked_dir, "atoms", f"{molecule}.json"), "w") as f:
             json.dump(atoms, f, separators=(",", ":"))
+        with open(os.path.join(baked_dir, "hbonds", f"{molecule}.json"), "w") as f:
+            json.dump(server.hbond_pairs(server._get_session()), f, separators=(",", ":"))
 
     manifest = {
         "molecules": molecules,
@@ -87,6 +90,7 @@ def bake(out_dir, molecules=MOLECULES, reps=REPS, colors=COLORS):
         "colors": colors,
         "files": files,
         "atoms": {m: f"baked/atoms/{m}.json" for m in molecules},
+        "hbonds": {m: f"baked/hbonds/{m}.json" for m in molecules},
     }
     with open(os.path.join(baked_dir, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=1)

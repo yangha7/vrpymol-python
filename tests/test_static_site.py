@@ -258,6 +258,13 @@ def test_quest3_emulator_trigger_selects_and_a_button_toggles_sequence(static_si
         cartoon = page.evaluate("() => vrPymolDebug.layerTriangles('cartoon')")
         assert cartoon["visible"] == cartoon["total"] > 0
 
+        # H-bonds come from the file baked by real PyMOL; with one residue
+        # selected (by the trigger above), only that residue's bonds show.
+        page.evaluate("() => vrPymolDebug.showHbonds()")
+        hbonds = page.evaluate("() => vrPymolDebug.hbonds")
+        assert hbonds["pairs"] == 37  # crambin, see test_measure_and_hbonds.py
+        assert 0 < hbonds["shown"] < 37 and hbonds["dashes"] >= hbonds["shown"], hbonds
+
         # A hides the board, A again brings it back.
         for expected in (False, True):
             page.evaluate("() => __xrDevice.controllers.right.updateButtonValue('a-button', 1)")

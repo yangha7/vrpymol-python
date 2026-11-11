@@ -23,11 +23,12 @@ PyMOL's own OBJ/COLLADA export bakes spheres/cartoons into degenerate or bulky m
 - **Cartoon detail**: flat/smooth sheets, smooth loops (real `cartoon_*` settings).
 - **Size controls**: stick radius, sphere scale (real `cmd.set` settings).
 - **Show/hide hydrogens and waters.**
-- **Click-to-measure**: click two atoms to get their real PyMOL distance (`cmd.get_distance`).
+- **Measuring tools**: distance (2 atoms), angle (3) and dihedral (4), picked with the trigger in VR or a click on desktop, drawn on the molecule with a value label that keeps a readable size at any zoom. Values match PyMOL's `get_distance` / `get_angle` / `get_dihedral`. While a measuring tool is active the atom under the ray is highlighted before you pick it.
+- **H-bonds**: PyMOL's own polar-contact finder (`cmd.find_pairs`, hydrogen-bond mode, waters excluded), drawn as yellow dashes for the selection or the whole molecule.
 - **Multiple objects at once**: load several molecules into the same scene via the "additional objects" panel — auto-arranged so they don't overlap.
 - **Multiple states / movie frames**: a real `cmd.frame` slider appears for multi-state molecules (e.g. NMR ensembles — try `1le0`, a real 20-model structure).
 - **Residue selection**: point at the molecule to select a residue, or pick residues (click one, sweep for a range) in a sequence window. Selected atoms get pink markers and the selection is shown as a PyMOL expression (`chain A and resi 6-18`). Works in the static build too.
-- **VR controls**: **trigger** selects (a residue on the molecule, or a letter on the sequence window), **grip** grabs — one hand to move/rotate, both hands to scale and rotate — **thumbstick** forward/back zooms, **A/B** (X/Y on the left hand) shows or hides the menu window, which floats below the molecule and carries show/hide buttons per representation, selection helpers (all / invert / none) and the sequence.
+- **VR controls**: **trigger** selects (a residue on the molecule, or a letter on the sequence window), **grip** grabs — one hand to move/rotate, both hands to scale and rotate — **thumbstick** forward/back zooms, **A/B** (X/Y on the left hand) shows or hides the menu window, which floats below the molecule and carries show/hide buttons per representation and for H-bonds, selection helpers (all / invert / none), the pointer tool (select / distance / angle / dihedral) and the sequence.
 - **Reset view**, background color picker.
 
 **Known architectural limits** (checked directly against PyMOL's real VRML2 export, not assumed): 2D atom/residue **labels** and per-representation **transparency** never survive this export path — PyMOL's own VRML2 writer doesn't emit them regardless of settings. Everything else in the app is a real, verified PyMOL feature.
@@ -57,7 +58,7 @@ It prints an HTTPS URL (WebXR requires a secure context, so the server terminate
 
 A serverless build is published at **https://anpigzhao-jpg.github.io/vrpymol-python/** — open it in the Meta Quest Browser and tap "Enter VR". Nothing needs to run on your computer.
 
-Since PyMOL can't run inside a browser, the static build is pre-baked: `webxr/bake_static.py` runs the same real-PyMOL export pipeline ahead of time for every molecule × representation × color scheme in a fixed grid, compresses each scene to a quantized `.glb` (`vr_pymol/glb_pack.py`), and writes a per-molecule atom table so click-to-measure still works client-side. Six representations are baked (cartoon, sticks, spheres, lines, ribbon, surface) and can be mixed per selection exactly as with the live server; nonbonded, nb_spheres, mesh and dots, extra objects, NMR frames and the size/cartoon sliders need the live server above.
+Since PyMOL can't run inside a browser, the static build is pre-baked: `webxr/bake_static.py` runs the same real-PyMOL export pipeline ahead of time for every molecule × representation × color scheme in a fixed grid, compresses each scene to a quantized `.glb` (`vr_pymol/glb_pack.py`), and writes a per-molecule atom table and H-bond list, so selection, measuring and H-bonds work without a server. Six representations are baked (cartoon, sticks, spheres, lines, ribbon, surface) and can be mixed per selection exactly as with the live server; nonbonded, nb_spheres, mesh and dots, extra objects, NMR frames and the size/cartoon sliders need the live server above.
 
 Rebuild and publish:
 

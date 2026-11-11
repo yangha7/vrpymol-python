@@ -427,6 +427,37 @@ def atom_table(session: PymolSession, state: int = 1) -> list[dict]:
     return atoms
 
 
+def hbond_pairs(session: PymolSession, state: int = 1) -> list[list]:
+    """Hydrogen-bonded atom pairs, as PyMOL itself finds them.
+
+    Uses `cmd.find_pairs(..., mode=1)`, PyMOL's hydrogen-bond geometry test
+    on N and O atoms, at its documented defaults (3.5 Angstrom cutoff,
+    45 degree angle). It works from heavy atoms, so structures without
+    hydrogens are fine. Waters are left out: on a hydrated structure they
+    add hundreds of contacts that bury the ones inside the molecule.
+
+    Returns `[object_a, index_a, object_b, index_b]` rows, each pair once
+    (PyMOL reports every bond from both ends), with indices matching the
+    atom table's `index`.
+    """
+    selection = "(elem N+O) and not solvent"
+    found = session.cmd.find_pairs(
+        selection, selection, state1=state, state2=state, mode=1, cutoff=3.5, angle=45
+    )
+    unique = {tuple(sorted((tuple(a), tuple(b)))) for a, b in found}
+    return [[a[0], a[1], b[0], b[1]] for a, b in sorted(unique)]
+
+
+@app.route("/api/hbonds")
+def api_hbonds():
+    with _lock:
+        session = _get_session()
+        max_states = session.cmd.count_states("all") if _objects else 1
+        state = max(1, min(_display_settings["frame"], max_states))
+        pairs = hbond_pairs(session, state)
+    return jsonify({"ok": True, "pairs": pairs})
+
+
 @app.route("/api/atoms")
 def api_atoms():
     """The atom table for the scene as currently exported, so the frontend
