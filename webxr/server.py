@@ -348,6 +348,45 @@ def api_objects_remove(name):
     return jsonify({"ok": True, "objects": objects, "max_states": max_states})
 
 
+def atom_table(session: PymolSession, state: int = 1) -> list[dict]:
+    """Every atom of every loaded object, as the records `/api/pick` returns.
+
+    `coord` is in Angstroms in PyMOL's model frame -- the same frame glTF
+    export bakes into vertex positions -- rounded to the 3 decimals a PDB
+    file carries. `state` is the 1-based PyMOL state to read coordinates
+    from, clamped per object (a single-state object next to an NMR ensemble
+    stays on its only state, as it does in the exported scene).
+    """
+    atoms = []
+    for object_name in session.cmd.get_object_list():
+        object_state = max(1, min(state, session.cmd.count_states(object_name)))
+        for atom in session.cmd.get_model(object_name, state=object_state).atom:
+            atoms.append(
+                {
+                    "object": object_name,
+                    "index": atom.index,
+                    "name": atom.name,
+                    "resn": atom.resn,
+                    "resi": atom.resi,
+                    "chain": atom.chain,
+                    "element": atom.symbol,
+                    "coord": [round(c, 3) for c in atom.coord],
+                }
+            )
+    return atoms
+
+
+@app.route("/api/atoms")
+def api_atoms():
+    """The atom table for the scene as currently exported, so the frontend
+    can build the sequence and select residues without a request per pick."""
+    with _lock:
+        session = _get_session()
+        atoms = atom_table(session, _display_settings["frame"])
+        objects = [{"name": n, "molecule": m} for n, m in _objects.items()]
+    return jsonify({"ok": True, "objects": objects, "atoms": atoms})
+
+
 @app.route("/api/pick")
 def api_pick():
     """Nearest real atom to a 3D point, for click-to-select/measure.

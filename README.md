@@ -26,7 +26,8 @@ PyMOL's own OBJ/COLLADA export bakes spheres/cartoons into degenerate or bulky m
 - **Click-to-measure**: click two atoms to get their real PyMOL distance (`cmd.get_distance`).
 - **Multiple objects at once**: load several molecules into the same scene via the "additional objects" panel — auto-arranged so they don't overlap.
 - **Multiple states / movie frames**: a real `cmd.frame` slider appears for multi-state molecules (e.g. NMR ensembles — try `1le0`, a real 20-model structure).
-- **VR interaction**: single-hand grab/rotate, two-handed pinch-to-scale and rotate, all built on the WebXR controller API.
+- **Residue selection**: point at the molecule to select a residue, or pick residues (click one, sweep for a range) in a sequence window. Selected atoms get pink markers and the selection is shown as a PyMOL expression (`chain A and resi 6-18`). Works in the static build too.
+- **VR controls**: **trigger** selects (a residue on the molecule, or a letter on the sequence window), **grip** grabs — one hand to move/rotate, both hands to scale and rotate — **thumbstick** forward/back zooms, **A/B** (X/Y on the left hand) shows or hides the sequence window, which floats below the molecule.
 - **Reset view**, background color picker.
 
 **Known architectural limits** (checked directly against PyMOL's real VRML2 export, not assumed): 2D atom/residue **labels** and per-representation **transparency** never survive this export path — PyMOL's own VRML2 writer doesn't emit them regardless of settings. Everything else in the app is a real, verified PyMOL feature.
@@ -39,7 +40,7 @@ Requires [Homebrew](https://brew.sh) and `conda`/`mamba` (via miniforge):
 brew install --cask miniforge
 conda create -n vrpymol -c conda-forge pymol-open-source python=3.11
 conda activate vrpymol
-pip install vtk numpy pytest pygltflib playwright
+pip install vtk numpy flask cryptography pytest pygltflib playwright
 playwright install chromium  # only needed to run the frontend test suite
 ```
 

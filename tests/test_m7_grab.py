@@ -6,7 +6,7 @@ the plan's M7 note). What *is* verifiable headlessly: the interaction code
 itself runs without error in a real (non-XR) browser session, and its
 grab/reparent/scale/rotate/translate math is correct -- exercised here via
 the `window.vrPymolDebug` hooks `app.js` exposes specifically for this
-(`onSelectStart`/`onSelectEnd`/`controllers`/`grabbers`/`model`), driving the
+(`onGrabStart`/`onGrabEnd`/`controllers`/`grabbers`/`model`), driving the
 two `renderer.xr.getController()` objects by hand (positioning them and
 firing the same select events a real controller would) instead of a real
 XR input source.
@@ -87,7 +87,7 @@ def test_single_hand_grab_and_two_hand_scale(live_server):
         # (identity rotation -> ray direction is world -Z), one unit away.
         _move_controller(page, 0, cx, cy, cz + 1)
 
-        page.evaluate("() => window.vrPymolDebug.onSelectStart(0)")
+        page.evaluate("() => window.vrPymolDebug.onGrabStart(0)")
         grabbers = page.evaluate("() => window.vrPymolDebug.grabbers")
         assert grabbers == [0], f"expected controller 0 to grab, got {grabbers}"
 
@@ -110,7 +110,7 @@ def test_single_hand_grab_and_two_hand_scale(live_server):
         # two controllers start out a known nonzero distance apart -> switch
         # into two-handed tracking.
         _move_controller(page, 1, cx + 0.5, cy, cz + 1.3)
-        page.evaluate("() => window.vrPymolDebug.onSelectStart(1)")
+        page.evaluate("() => window.vrPymolDebug.onGrabStart(1)")
         grabbers = page.evaluate("() => window.vrPymolDebug.grabbers")
         assert grabbers == [0, 1], f"expected both controllers grabbing, got {grabbers}"
 
@@ -136,8 +136,8 @@ def test_single_hand_grab_and_two_hand_scale(live_server):
 
         # Release both -> model should end up back under the scene, untouched
         # by either controller.
-        page.evaluate("() => window.vrPymolDebug.onSelectEnd(0)")
-        page.evaluate("() => window.vrPymolDebug.onSelectEnd(1)")
+        page.evaluate("() => window.vrPymolDebug.onGrabEnd(0)")
+        page.evaluate("() => window.vrPymolDebug.onGrabEnd(1)")
         grabbers = page.evaluate("() => window.vrPymolDebug.grabbers")
         assert grabbers == [], f"expected no grabbers after release, got {grabbers}"
         final_info = _get_box_center_and_position(page, "window.vrPymolDebug.model")

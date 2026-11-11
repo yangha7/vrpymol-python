@@ -78,20 +78,7 @@ def bake(out_dir, molecules=MOLECULES, reps=REPS, colors=COLORS):
                 files[f"{molecule}|{rep}|{color}"] = f"baked/{name}"
                 print(f"[{done}/{total}] {name} ({time.time() - start:.1f}s)", flush=True)
 
-        session = server._get_session()
-        atoms = [
-            {
-                "object": "mol",
-                "index": a.index,
-                "name": a.name,
-                "resn": a.resn,
-                "resi": a.resi,
-                "chain": a.chain,
-                "element": a.symbol,
-                "coord": [round(c, 3) for c in a.coord],
-            }
-            for a in session.cmd.get_model("mol", state=1).atom
-        ]
+        atoms = server.atom_table(server._get_session())
         with open(os.path.join(baked_dir, "atoms", f"{molecule}.json"), "w") as f:
             json.dump(atoms, f, separators=(",", ":"))
 

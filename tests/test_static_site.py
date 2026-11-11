@@ -179,7 +179,7 @@ def test_quest3_emulator_enter_vr_molecule_in_front_and_trigger_grab(static_site
         assert math.dist(head, center) < 1.5, layout
 
         # Aim the emulated right Touch controller straight at the molecule
-        # (identity orientation points down -Z) and squeeze the trigger.
+        # (identity orientation points down -Z) and squeeze the grip.
         cx, cy, cz = center
         page.evaluate(
             f"""() => {{
@@ -189,10 +189,69 @@ def test_quest3_emulator_enter_vr_molecule_in_front_and_trigger_grab(static_site
             }}"""
         )
         page.wait_for_timeout(300)
-        page.evaluate("() => __xrDevice.controllers.right.updateButtonValue('trigger', 1)")
+        page.evaluate("() => __xrDevice.controllers.right.updateButtonValue('squeeze', 1)")
         page.wait_for_function("() => vrPymolDebug.grabbers.length === 1", timeout=5000)
 
-        page.evaluate("() => __xrDevice.controllers.right.updateButtonValue('trigger', 0)")
+        page.evaluate("() => __xrDevice.controllers.right.updateButtonValue('squeeze', 0)")
         page.wait_for_function("() => vrPymolDebug.grabbers.length === 0", timeout=5000)
+        assert errors == []
+        browser.close()
+
+
+def test_quest3_emulator_trigger_selects_and_a_button_toggles_sequence(static_site):
+    url, _ = static_site
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page(viewport={"width": 800, "height": 600})
+        errors = []
+        page.on("pageerror", lambda exc: errors.append(str(exc)))
+        page.goto(f"{url}/quest-emulator.html", wait_until="networkidle")
+        _wait_loaded(page, "1crn__cartoon__default.glb")
+        # static mode builds the sequence from the baked atom table
+        page.wait_for_function("() => vrPymolDebug.sequence.length === 1", timeout=5000)
+
+        page.click("#VRButton")
+        page.wait_for_function("() => vrPymolDebug.renderer.xr.isPresenting", timeout=10000)
+        # the sequence board opens by itself, below eye level
+        page.wait_for_function("() => vrPymolDebug.sequencePanel.visible", timeout=5000)
+        geometry = page.evaluate(
+            """async () => {
+                const THREE = await import("three");
+                const head = vrPymolDebug.renderer.xr.getCamera().getWorldPosition(new THREE.Vector3());
+                const center = new THREE.Box3().setFromObject(vrPymolDebug.model).getCenter(new THREE.Vector3());
+                return {
+                    head: head.toArray(),
+                    panel: vrPymolDebug.sequencePanel.position.toArray(),
+                    center: center.toArray(),
+                };
+            }"""
+        )
+        assert geometry["panel"][1] < geometry["head"][1] - 0.3, geometry
+        assert geometry["panel"][2] < geometry["head"][2], geometry
+
+        # Trigger while aiming at the molecule selects a residue, no grab.
+        cx, cy, cz = geometry["center"]
+        page.evaluate(
+            f"""() => {{
+                const right = __xrDevice.controllers.right;
+                right.position.set({cx}, {cy}, {cz + 0.4});
+                right.quaternion.set(0, 0, 0, 1);
+            }}"""
+        )
+        page.wait_for_timeout(300)
+        page.evaluate("() => __xrDevice.controllers.right.updateButtonValue('trigger', 1)")
+        page.wait_for_function("() => vrPymolDebug.selectedKeys.length === 1", timeout=5000)
+        page.evaluate("() => __xrDevice.controllers.right.updateButtonValue('trigger', 0)")
+        assert page.evaluate("() => vrPymolDebug.grabbers") == []
+        assert page.evaluate("() => vrPymolDebug.selectionMarkerCount") > 0
+
+        # A hides the board, A again brings it back.
+        for expected in (False, True):
+            page.evaluate("() => __xrDevice.controllers.right.updateButtonValue('a-button', 1)")
+            page.wait_for_function(
+                f"() => vrPymolDebug.sequencePanel.visible === {str(expected).lower()}", timeout=5000
+            )
+            page.evaluate("() => __xrDevice.controllers.right.updateButtonValue('a-button', 0)")
+            page.wait_for_timeout(200)
         assert errors == []
         browser.close()
