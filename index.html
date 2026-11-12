@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>VR PyMOL</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #00004d; }
+    canvas { display: block; }
+    #hud {
+      position: fixed; top: 8px; left: 8px; z-index: 1;
+      font-family: monospace; color: #fff; background: rgba(0,0,0,0.4);
+      padding: 6px 10px; border-radius: 4px; font-size: 13px;
+    }
+    #controls {
+      position: fixed; top: 8px; right: 8px; bottom: 8px; z-index: 1;
+      font-family: monospace; color: #fff; background: rgba(0,0,0,0.55);
+      padding: 8px 10px; border-radius: 4px; font-size: 13px;
+      max-width: 220px; overflow-y: auto;
+    }
+    #controls > section { margin-bottom: 8px; }
+    #controls > section:last-child { margin-bottom: 0; }
+    #controls input:disabled, #controls select:disabled { opacity: 0.4; cursor: not-allowed; }
+    #controls h4 { margin: 0 0 4px; font-size: 12px; opacity: 0.7; font-weight: normal; }
+    #controls select { margin-left: 4px; }
+    #controls label.rep-option { display: block; }
+    #controls input[type="range"] { width: 60%; vertical-align: middle; }
+    #controls .slow-hint { opacity: 0.6; font-size: 11px; }
+    #reset-view { width: 100%; margin-top: 2px; font-family: monospace; }
+    #measure-hud { min-height: 2.4em; margin: 4px 0; word-wrap: break-word; }
+    #clear-measurements { width: 100%; font-family: monospace; }
+    #object-list { list-style: none; margin: 4px 0; padding: 0; }
+    #object-list li { display: flex; justify-content: space-between; align-items: center; padding: 2px 0; }
+    #object-list button { font-family: monospace; margin-left: 6px; }
+    #add-object-button { margin-left: 4px; font-family: monospace; }
+    #frame-slider { width: 60%; vertical-align: middle; }
+    #selection-hud { min-height: 1.2em; margin: 4px 0; word-wrap: break-word; }
+    #controls button { font-family: monospace; }
+    #save-group, #delete-group, #paint-reset { width: 100%; margin-top: 2px; }
+    #group-list button { margin: 2px 2px 0 0; }
+    #group-list button.active { outline: 2px solid #ff66cc; }
+    #group-name { width: 60%; font-family: monospace; }
+    #paint-swatches button { width: 20px; height: 20px; padding: 0; margin: 2px 2px 0 0; border: 1px solid #fff; cursor: pointer; }
+    #opacity-buttons button { width: 23%; margin-top: 2px; padding: 1px 0; }
+    #undo, #redo { width: 48%; margin-bottom: 2px; }
+    #controls button:disabled { opacity: 0.4; }
+    #toggle-sequence, #clear-selection, #select-all, #invert-selection { width: 100%; font-family: monospace; margin-top: 2px; }
+    #sequence-popout {
+      position: fixed; left: 8px; bottom: 64px; right: 250px; z-index: 1;
+      max-height: 45%; overflow-y: auto; border-radius: 4px;
+    }
+    #sequence-canvas { display: block; width: 100%; cursor: pointer; touch-action: none; }
+    @media (max-width: 600px) { #sequence-popout { right: 8px; } }
+  </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "./vendor/three.module.js"
+      }
+    }
+  </script>
+  <meta name="vrpymol-static-manifest" content="./baked/manifest.json" />
+</head>
+<body>
+  <div id="hud">loading...</div>
+  <div id="controls">
+    <section>
+      <h4>molecule</h4>
+      <select id="molecule-select">
+        <option value="1crn">1crn</option>
+        <option value="caffeine">caffeine</option>
+        <option value="1mbn">1mbn</option>
+        <option value="1bna">1bna</option>
+        <option value="4hhb">4hhb</option>
+        <option value="1lyz">1lyz</option>
+        <option value="1gfl">1gfl</option>
+        <option value="1le0">1le0 (NMR, 20 states)</option>
+      </select>
+    </section>
+    <section data-server-only>
+      <h4>additional objects &mdash; view multiple molecules at once</h4>
+      <select id="add-object-select">
+        <option value="1crn">1crn</option>
+        <option value="caffeine">caffeine</option>
+        <option value="1mbn">1mbn</option>
+        <option value="1bna">1bna</option>
+        <option value="4hhb">4hhb</option>
+        <option value="1lyz">1lyz</option>
+        <option value="1gfl">1gfl</option>
+        <option value="1le0">1le0 (NMR, 20 states)</option>
+      </select>
+      <button id="add-object-button" type="button">add</button>
+      <ul id="object-list"></ul>
+    </section>
+    <section id="frame-section" data-server-only hidden>
+      <h4>state / frame</h4>
+      <label class="rep-option">frame
+        <input type="range" id="frame-slider" min="1" max="1" step="1" value="1" />
+        <span id="frame-value">1 / 1</span>
+      </label>
+    </section>
+    <section>
+      <h4 id="rep-heading">show as (combinable) &mdash; applies to the selection, or to everything when nothing is selected</h4>
+      <div id="rep-checkboxes">
+        <label class="rep-option"><input type="checkbox" value="cartoon" checked /> cartoon</label>
+        <label class="rep-option"><input type="checkbox" value="sticks" /> sticks</label>
+        <label class="rep-option"><input type="checkbox" value="ball_and_stick" /> ball + stick</label>
+        <label class="rep-option"><input type="checkbox" value="spheres" /> spheres</label>
+        <label class="rep-option"><input type="checkbox" value="lines" /> lines</label>
+        <label class="rep-option"><input type="checkbox" value="ribbon" /> ribbon</label>
+        <label class="rep-option"><input type="checkbox" value="nonbonded" /> nonbonded</label>
+        <label class="rep-option"><input type="checkbox" value="nb_spheres" /> nb_spheres</label>
+        <label class="rep-option"><input type="checkbox" value="surface" /> surface <span class="slow-hint">(may be slow)</span></label>
+        <label class="rep-option"><input type="checkbox" value="mesh" /> mesh <span class="slow-hint">(may be slow)</span></label>
+        <label class="rep-option"><input type="checkbox" value="dots" /> dots <span class="slow-hint">(may be slow)</span></label>
+      </div>
+    </section>
+    <section data-server-only>
+      <h4>cartoon detail</h4>
+      <label class="rep-option"><input type="checkbox" id="cartoon-flat-sheets" checked /> flat sheets</label>
+      <label class="rep-option"><input type="checkbox" id="cartoon-smooth-loops" /> smooth loops</label>
+    </section>
+    <section data-server-only>
+      <h4>atoms</h4>
+      <label class="rep-option"><input type="checkbox" id="show-hydrogens" checked /> show hydrogens</label>
+      <label class="rep-option"><input type="checkbox" id="show-waters" checked /> show waters</label>
+    </section>
+    <section>
+      <h4>colouring scheme &mdash; of the selection, or of everything</h4>
+      <select id="color-select">
+        <option value="default">default (CPK)</option>
+        <option value="chain">by chain</option>
+        <option value="rainbow">rainbow (N&rarr;C)</option>
+        <option value="secondary-structure">by secondary structure</option>
+        <option value="b-factor">by b-factor</option>
+      </select>
+    </section>
+    <section data-server-only>
+      <h4>size</h4>
+      <label class="rep-option">stick radius
+        <input type="range" id="stick-radius" min="0.02" max="0.6" step="0.01" value="0.1" />
+        <span id="stick-radius-value">0.10</span>
+      </label>
+      <label class="rep-option">sphere scale
+        <input type="range" id="sphere-scale" min="0.1" max="1.5" step="0.05" value="1.0" />
+        <span id="sphere-scale-value">1.00</span>
+      </label>
+    </section>
+    <section>
+      <h4>background</h4>
+      <input type="color" id="bg-color" value="#00004d" />
+    </section>
+    <section>
+      <h4>H-bonds and hydrogens &mdash; of the selection, or of everything</h4>
+      <label class="rep-option"><input type="checkbox" id="show-hbonds" /> show H-bonds</label>
+      <label class="rep-option"><input type="checkbox" id="show-hydrogen-atoms" /> show H atoms <span class="slow-hint">(polar, added by PyMOL)</span></label>
+    </section>
+    <section>
+      <h4>pointer tool &mdash; what a click on the molecule does</h4>
+      <select id="tool-mode">
+        <option value="select">select residue</option>
+        <option value="distance">measure distance (2 atoms)</option>
+        <option value="angle">measure angle (3 atoms)</option>
+        <option value="dihedral">measure dihedral (4 atoms)</option>
+      </select>
+      <div id="measure-hud" class="slow-hint">&nbsp;</div>
+      <button id="clear-measurements" type="button">clear measurements</button>
+    </section>
+    <section>
+      <h4>select residues</h4>
+      <div id="selection-hud" class="slow-hint">nothing selected</div>
+      <button id="toggle-sequence" type="button">show menu and sequence</button>
+      <button id="select-all" type="button">select all</button>
+      <button id="invert-selection" type="button">invert selection</button>
+      <button id="clear-selection" type="button">clear selection</button>
+    </section>
+    <section>
+      <h4>groups &mdash; saved, named selections</h4>
+      <button id="save-group" type="button">save selection as group</button>
+      <div id="group-list"></div>
+      <label class="rep-option">name <input type="text" id="group-name" maxlength="16" disabled /></label>
+      <button id="delete-group" type="button">delete group</button>
+    </section>
+    <section>
+      <h4>colour and opacity (100% solid, 25% see-through) &mdash; of the selection, or of everything</h4>
+      <div id="paint-swatches"></div>
+      <button id="paint-reset" type="button">reset colour</button>
+      <div id="opacity-buttons">
+        <button type="button" data-level="0">100%</button>
+        <button type="button" data-level="1">75%</button>
+        <button type="button" data-level="2">50%</button>
+        <button type="button" data-level="3">25%</button>
+      </div>
+    </section>
+    <section>
+      <button id="undo" type="button" disabled>undo</button>
+      <button id="redo" type="button" disabled>redo</button>
+      <button id="reset-view" type="button">reset view</button>
+    </section>
+  </div>
+  <div id="sequence-popout" hidden><canvas id="sequence-canvas"></canvas></div>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
