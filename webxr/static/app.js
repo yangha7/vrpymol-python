@@ -124,12 +124,25 @@ let baseScheme = "default";
 const residueScheme = new Map(); // residue key -> scheme, where it differs from baseScheme
 const layers = new Map(); // "rep|scheme" -> {rep, scheme, state: "loading"|"ready"|"missing", root, parts}
 
+// Polar hydrogens (on N and O) are added by PyMOL, since crystal structures
+// have none. They come as overlay layers -- "this representation, hydrogens
+// only" -- drawn for the residues listed here, on top of the normal layer.
+const HYDROGEN_REPS = new Set(["sticks", "ball_and_stick", "spheres", "lines"]);
+const hydrogenKeys = new Set(); // residue keys whose hydrogens are shown
+let sceneHydrogens = null; // the hydrogen atoms themselves; null until fetched
+let hydrogensByParent = new Map(); // "object|index" of an N or O -> its hydrogens
+let hydrogenById = new Map(); // "object|index" of a hydrogen -> the hydrogen
+
 function schemeOfKey(key) {
   return residueScheme.get(key) ?? baseScheme;
 }
 
-function layersOfRep(rep) {
-  return Array.from(layers.values()).filter((layer) => layer.rep === rep);
+// The layers drawing `rep`'s heavy atoms, or with `hydrogens` its hydrogen
+// overlays.
+function layersOfRep(rep, hydrogens = false) {
+  return Array.from(layers.values()).filter(
+    (layer) => layer.rep === rep && Boolean(layer.hydrogens) === hydrogens,
+  );
 }
 let staleLayers = []; // previous scene's layers, kept on screen until the new ones arrive
 let sceneRequestInFlight = false;
@@ -313,8 +326,10 @@ function smoothLayer(root) {
 // Work out which residue every triangle of a freshly loaded layer belongs
 // to, and give each mesh an index buffer that can be rewritten to draw any
 // subset of them.
-function buildLayerParts(root, rep) {
-  const assign = residueAssigner(rep);
+function buildLayerParts(root, rep, hydrogens) {
+  // A hydrogen sits within about 1 A of the atom it is bonded to, so
+  // "nearest atom" finds its residue whatever the representation.
+  const assign = residueAssigner(hydrogens ? "hydrogens" : rep);
   const parts = [];
   const vertex = new THREE.Vector3();
   root.updateMatrixWorld(true); // not yet in the scene, so "world" is the atom frame
@@ -440,7 +455,9 @@ function applyLayerMask(layer) {
   const mask = new Uint8Array(allResidues.length);
   for (const key of shownByRep.get(layer.rep)) {
     const residue = residueByKey.get(key);
-    if (residue && schemeOfKey(key) === layer.scheme) mask[residue.ordinal] = 1;
+    if (!residue || schemeOfKey(key) !== layer.scheme) continue;
+    if (layer.hydrogens && !hydrogenKeys.has(key)) continue;
+    mask[residue.ordinal] = 1;
   }
   const level = new Uint8Array(allResidues.length);
   for (const [key, value] of residueOpacity) {
@@ -487,12 +504,16 @@ function applyLayerMask(layer) {
   }
 }
 
-function layerUrl(rep, scheme) {
+function layerUrl(rep, scheme, hydrogens) {
   if (staticManifest) {
-    return staticManifest.files[`${sceneObjects.mol}|${rep}|${scheme}`] || null;
+    const key = `${sceneObjects.mol}|${rep}|${scheme}${hydrogens ? "|H" : ""}`;
+    return staticManifest.files[key] || null;
   }
   // cache-bust: the server re-exports on every request
-  return `/api/layer?rep=${encodeURIComponent(rep)}&color=${encodeURIComponent(scheme)}&t=${Date.now()}`;
+  return (
+    `/api/layer?rep=${encodeURIComponent(rep)}&color=${encodeURIComponent(scheme)}` +
+    `${hydrogens ? "&h=1" : ""}&t=${Date.now()}`
+  );
 }
 
 function anyLayerLoading() {
@@ -519,6 +540,16 @@ function layerSettled() {
 // off, and if that leaves the scene empty fall back to sticks.
 function layerMissing(layer) {
   layer.state = "missing";
+  if (layer.hydrogens) {
+    // No N-H or O-H in this molecule (or a build without hydrogen layers):
+    // nothing to overlay, and the representation itself is unaffected.
+    hydrogenKeys.clear();
+    hud.textContent = "no polar hydrogens to show for this molecule";
+    layerSettled();
+    historyAmend = true;
+    representationChanged();
+    return;
+  }
   shownByRep.get(layer.rep).clear();
   hud.textContent = `${layer.rep}: nothing to draw for this molecule`;
   const nothingShown = availableReps.every((rep) => shownByRep.get(rep).size === 0);
@@ -533,11 +564,11 @@ function layerMissing(layer) {
   representationChanged();
 }
 
-function loadLayer(rep, scheme) {
-  const key = `${rep}|${scheme}`;
-  const layer = { rep, scheme, state: "loading", root: null, parts: [] };
+function loadLayer(rep, scheme, hydrogens) {
+  const key = `${rep}|${scheme}${hydrogens ? "|H" : ""}`;
+  const layer = { rep, scheme, hydrogens, state: "loading", root: null, parts: [] };
   layers.set(key, layer);
-  const url = layerUrl(rep, scheme);
+  const url = layerUrl(rep, scheme, hydrogens);
   if (!url) {
     layerMissing(layer);
     return;
@@ -550,9 +581,9 @@ function loadLayer(rep, scheme) {
       // several MB) -- don't let a stale layer into the new scene.
       if (layers.get(key) !== layer) return;
       layer.root = gltf.scene;
-      layer.root.name = `layer-${rep}-${scheme}`;
+      layer.root.name = `layer-${rep}-${scheme}${hydrogens ? "-H" : ""}`;
       if (SMOOTH_REPS.has(rep)) smoothLayer(layer.root);
-      layer.parts = buildLayerParts(layer.root, rep);
+      layer.parts = buildLayerParts(layer.root, rep, hydrogens);
       currentModel.add(layer.root);
       layer.state = "ready";
       applyLayerMask(layer);
@@ -571,11 +602,14 @@ function loadLayer(rep, scheme) {
 // Bring what is drawn in line with the state: fetch layers that are now
 // needed, re-mask the ones already loaded, retire the ones no residue uses.
 function ensureLayers() {
-  const needed = new Map(); // "rep|scheme" -> [rep, scheme]
+  const needed = new Map(); // layer key -> [rep, scheme, hydrogens]
   for (const rep of availableReps) {
     for (const key of shownByRep.get(rep)) {
       const scheme = schemeOfKey(key);
-      needed.set(`${rep}|${scheme}`, [rep, scheme]);
+      needed.set(`${rep}|${scheme}`, [rep, scheme, false]);
+      if (HYDROGEN_REPS.has(rep) && hydrogenKeys.has(key)) {
+        needed.set(`${rep}|${scheme}|H`, [rep, scheme, true]);
+      }
     }
   }
   for (const [key, layer] of layers) {
@@ -586,15 +620,57 @@ function ensureLayers() {
     staleLayers.push(layer);
     layers.delete(key);
   }
-  for (const [key, [rep, scheme]] of needed) {
+  for (const [key, [rep, scheme, hydrogens]] of needed) {
     const layer = layers.get(key);
     if (!layer) {
-      if (!sceneChangePending) loadLayer(rep, scheme);
+      if (!sceneChangePending) loadLayer(rep, scheme, hydrogens);
     } else if (layer.state === "ready") {
       applyLayerMask(layer);
     }
   }
   layerSettled();
+}
+
+async function loadHydrogens() {
+  if (sceneHydrogens) return sceneHydrogens;
+  const epoch = sceneEpoch;
+  const url = staticManifest ? staticManifest.hydrogens?.[sceneObjects.mol] : "/api/hydrogens";
+  if (!url) return [];
+  const data = await (await fetch(url)).json();
+  if (epoch !== sceneEpoch) return []; // the scene changed while this was in flight
+  sceneHydrogens = staticManifest ? data : data.hydrogens;
+  hydrogensByParent = new Map();
+  hydrogenById = new Map(sceneHydrogens.map((h) => [`${h.object}|${h.index}`, h]));
+  for (const hydrogen of sceneHydrogens) {
+    const parent = `${hydrogen.object}|${hydrogen.parent}`;
+    if (!hydrogensByParent.has(parent)) hydrogensByParent.set(parent, []);
+    hydrogensByParent.get(parent).push(hydrogen);
+  }
+  return sceneHydrogens;
+}
+
+// Show or hide the hydrogens of some residues. They appear on whichever
+// atom-drawing representation the residue is shown in; a cartoon has no
+// atoms to hang them on.
+function setHydrogensShown(residues, shown) {
+  for (const residue of residues) {
+    if (shown) hydrogenKeys.add(residue.key);
+    else hydrogenKeys.delete(residue.key);
+  }
+  const drawable = residues.some((residue) =>
+    Array.from(HYDROGEN_REPS).some((rep) => shownByRep.get(rep)?.has(residue.key)),
+  );
+  if (shown && !drawable) {
+    hud.textContent = "hydrogens appear on sticks, ball+stick, lines or spheres -- show one of those too";
+  }
+  representationChanged();
+  // H-bond dashes start from the hydrogen once it is there to start from
+  loadHydrogens().then(() => {
+    pickableAtoms = null;
+    rebuildHbondDashes();
+  });
+  hydrogenCheckbox.checked = hydrogenKeys.size > 0;
+  hydrogenCheckbox.indeterminate = hydrogenKeys.size > 0 && hydrogenKeys.size < allResidues.length;
 }
 
 // Colour by a scheme: the selection, or the whole scene when nothing is
@@ -670,8 +746,12 @@ async function syncScene() {
   }
   const newMolecule = !currentModel || JSON.stringify(objects) !== JSON.stringify(sceneObjects);
   if (newMolecule) startNewModel(atoms);
+  sceneHydrogens = null; // fetched again for the new scene if hydrogens are shown
+  hydrogensByParent = new Map();
+  hydrogenById = new Map();
   setSceneAtoms(atoms, objects);
   representationChanged();
+  if (hydrogenKeys.size > 0) await loadHydrogens();
   refreshHbonds();
   if (newMolecule) resetHistory(); // undo never reaches back into another molecule
 }
@@ -1079,6 +1159,16 @@ function getPickableAtoms() {
       }
       pickableAtoms.push({ atom, radius });
     }
+    // its hydrogens too, where they are drawn
+    if (!hydrogenKeys.has(residue.key) || !reps.some((rep) => HYDROGEN_REPS.has(rep))) continue;
+    for (const atom of residue.atoms) {
+      for (const hydrogen of hydrogensByParent.get(`${atom.object}|${atom.index}`) || []) {
+        pickableAtoms.push({
+          atom: hydrogen,
+          radius: reps.includes("spheres") ? VDW_RADIUS.H * sphereScale : 0.5,
+        });
+      }
+    }
   }
   return pickableAtoms;
 }
@@ -1146,13 +1236,14 @@ clearMeasurementsButton.addEventListener("click", clearMeasurements);
 // --- H-bonds (polar contacts) ---
 //
 // Which atom pairs are hydrogen bonded is PyMOL's call, not the browser's:
-// the pairs come from PyMOL's own finder (`/api/hbonds`, or a file baked
+// the pairs come from PyMOL's own "find polar contacts" (`/api/hbonds`, or a file baked
 // per molecule for the static build). The browser only decides which of
 // them to draw: "show" adds every bond with an end in the target residues,
 // "hide" removes them, following the same selection-or-everything rule as
 // the representations.
 
 const hbondCheckbox = document.getElementById("show-hbonds");
+const hydrogenCheckbox = document.getElementById("show-hydrogen-atoms");
 const HBOND_COLOR = 0xffe14d;
 const HBOND_RADIUS = 0.07; // Angstroms
 const HBOND_DASH = 0.35; // dash and gap length, Angstroms
@@ -1162,6 +1253,7 @@ const HBOND_MATERIAL = new THREE.MeshBasicMaterial({ color: HBOND_COLOR });
 let hbondPairs = null; // [{key, a, b}] for the current scene; null until fetched
 const shownHbonds = new Set(); // keys of the pairs currently drawn
 let hbondDashes = null; // THREE.InstancedMesh, child of currentModel
+let hbondLengths = []; // length of each drawn bond, Angstroms
 
 async function loadHbondPairs() {
   if (hbondPairs) return hbondPairs;
@@ -1175,13 +1267,25 @@ async function loadHbondPairs() {
   if (epoch !== sceneEpoch) return []; // the scene changed while this was in flight
   const atomByIndex = new Map(sceneAtoms.map((atom) => [`${atom.object}|${atom.index}`, atom]));
   hbondPairs = (staticManifest ? data : data.pairs)
-    .map(([objectA, indexA, objectB, indexB]) => ({
+    .map(([objectA, indexA, objectB, indexB, hydrogen]) => ({
       key: `${objectA}|${indexA}|${objectB}|${indexB}`,
-      a: atomByIndex.get(`${objectA}|${indexA}`),
+      a: atomByIndex.get(`${objectA}|${indexA}`), // the donor, when a hydrogen is given
       b: atomByIndex.get(`${objectB}|${indexB}`),
+      hydrogenId: hydrogen == null ? null : `${objectA}|${hydrogen}`,
     }))
     .filter((pair) => pair.a && pair.b);
   return hbondPairs;
+}
+
+// Where a bond's dash runs: between the two heavy atoms, or -- when the
+// donor's hydrogens are shown -- from the hydrogen PyMOL reported the bond
+// through, which is the hydrogen bond proper. Returns two [x, y, z].
+function hbondEnds(pair) {
+  if (pair.hydrogenId && hydrogenKeys.has(residueKey(pair.a))) {
+    const hydrogen = hydrogenById.get(pair.hydrogenId);
+    if (hydrogen) return [hydrogen.coord, pair.b.coord];
+  }
+  return [pair.a.coord, pair.b.coord];
 }
 
 function rebuildHbondDashes() {
@@ -1199,10 +1303,13 @@ function rebuildHbondDashes() {
   const direction = new THREE.Vector3();
   const turn = new THREE.Quaternion();
   const size = new THREE.Vector3(1, HBOND_DASH, 1);
+  hbondLengths = [];
   for (const pair of pairs) {
-    a.fromArray(pair.a.coord);
-    b.fromArray(pair.b.coord);
+    const [from, to] = hbondEnds(pair);
+    a.fromArray(from);
+    b.fromArray(to);
     const length = a.distanceTo(b);
+    hbondLengths.push(length);
     direction.subVectors(b, a).normalize();
     turn.setFromUnitVectors(up, direction);
     // dashes centred on the bond, so both ends look the same
@@ -1258,6 +1365,9 @@ async function refreshHbonds() {
   syncHbondControl();
 }
 
+hydrogenCheckbox.addEventListener("change", () => {
+  setHydrogensShown(targetResidues(), hydrogenCheckbox.checked);
+});
 hbondCheckbox.addEventListener("change", () => {
   setHbondsShown(targetResidues(), hbondCheckbox.checked);
 });
@@ -1360,7 +1470,7 @@ function setSceneAtoms(atoms, objects) {
     return objects[objectName] !== sceneObjects[objectName] || !residueByKey.has(key);
   };
   const keySets = [selectedKeys, ...groups.map((group) => group.keys)];
-  for (const keys of [...keySets, residueColor, residueOpacity, residueScheme]) {
+  for (const keys of [...keySets, residueColor, residueOpacity, residueScheme, hydrogenKeys]) {
     for (const key of Array.from(keys.keys())) {
       if (isStale(key)) keys.delete(key);
     }
@@ -1759,6 +1869,7 @@ function captureState() {
     colors: Array.from(residueColor, ([key, color]) => [key, `#${color.getHexString()}`]),
     opacity: Array.from(residueOpacity),
     hbonds: Array.from(shownHbonds),
+    hydrogens: Array.from(hydrogenKeys),
     groups: groups.map((group) => ({ name: group.name, keys: Array.from(group.keys) })),
     activeGroup: activeGroup ? activeGroup.name : null,
     measurements: measurements.map((m) => ({
@@ -1787,8 +1898,13 @@ function restoreState(state) {
   groups = state.groups.map((group) => ({ name: group.name, keys: new Set(group.keys) }));
   activeGroup = groups.find((group) => group.name === state.activeGroup) || null;
   refill(shownHbonds, state.hbonds);
+  refill(hydrogenKeys, state.hydrogens || []);
+  hydrogenCheckbox.checked = hydrogenKeys.size > 0;
+  hydrogenCheckbox.indeterminate = hydrogenKeys.size > 0 && hydrogenKeys.size < allResidues.length;
 
-  const atomByIndex = new Map(sceneAtoms.map((atom) => [`${atom.object}|${atom.index}`, atom]));
+  const atomByIndex = new Map(
+    [...sceneAtoms, ...(sceneHydrogens || [])].map((atom) => [`${atom.object}|${atom.index}`, atom]),
+  );
   clearMeasurements();
   for (const saved of state.measurements) {
     const atoms = saved.atoms.map((id) => atomByIndex.get(id));
@@ -1803,7 +1919,11 @@ function restoreState(state) {
   selectionChanged();
   representationChanged(); // re-masks, repaints and re-fades every layer
   // the bond list may not be loaded yet if the scene was reloaded since
-  (shownHbonds.size > 0 ? loadHbondPairs() : Promise.resolve()).then(() => {
+  Promise.all([
+    shownHbonds.size > 0 ? loadHbondPairs() : null,
+    hydrogenKeys.size > 0 ? loadHydrogens() : null,
+  ]).then(() => {
+    pickableAtoms = null;
     rebuildHbondDashes();
     syncHbondControl();
   });
@@ -2030,16 +2150,18 @@ function menuButtons() {
     { kind: "redo", label: "redo" },
   ]);
 
-  const slots = availableReps.length + 2; // plus "h-bonds", and "everything" on the hide row
+  const slots = availableReps.length + 3; // plus "H atoms", "h-bonds", and "everything" on the hide row
   const repWidth = (right - left + SEQ_BUTTON_GAP) / slots - SEQ_BUTTON_GAP;
   rowLabel("show", SEQ_ROW_SHOW);
   place(left, SEQ_ROW_SHOW, repWidth, [
     ...availableReps.map((rep) => ({ kind: "show", rep, label: repLabel(rep) })),
+    { kind: "showHydrogens", label: "H atoms" },
     { kind: "showHbonds", label: "h-bonds" },
   ]);
   rowLabel("hide", SEQ_ROW_HIDE);
   place(left, SEQ_ROW_HIDE, repWidth, [
     ...availableReps.map((rep) => ({ kind: "hide", rep, label: repLabel(rep) })),
+    { kind: "hideHydrogens", label: "H atoms" },
     { kind: "hideHbonds", label: "h-bonds" },
     { kind: "hideAll", label: "everything" },
   ]);
@@ -2098,6 +2220,10 @@ function describeAction(action) {
       return `hide ${repLabel(action.rep)} of ${describeTarget()}`;
     case "hideAll":
       return `hide ${describeTarget()} completely`;
+    case "showHydrogens":
+      return `show the polar hydrogens (on N and O) of ${describeTarget()}`;
+    case "hideHydrogens":
+      return `hide the hydrogens of ${describeTarget()}`;
     case "showHbonds":
       return `show H-bonds of ${describeTarget()}`;
     case "hideHbonds":
@@ -2153,6 +2279,12 @@ function runMenuAction(action) {
       break;
     case "hideAll":
       hideEverything(targetResidues());
+      break;
+    case "showHydrogens":
+      setHydrogensShown(targetResidues(), true);
+      break;
+    case "hideHydrogens":
+      setHydrogensShown(targetResidues(), false);
       break;
     case "showHbonds":
       setHbondsShown(targetResidues(), true);
@@ -2307,6 +2439,7 @@ function drawSequence() {
       const lit =
         (action.kind === "show" && target.some((r) => shownByRep.get(action.rep).has(r.key))) ||
         (action.kind === "showHbonds" && shownHbonds.size > 0) ||
+        (action.kind === "showHydrogens" && target.some((r) => hydrogenKeys.has(r.key))) ||
         (action.kind === "tool" && action.tool === toolMode) ||
         (action.kind === "scheme" && target.some((r) => schemeOfKey(r.key) === action.scheme)) ||
         (action.kind === "opacity" &&
@@ -2578,9 +2711,10 @@ window.vrPymolDebug = {
   showRep: (rep) => setRepShown(rep, targetResidues(), true),
   hideRep: (rep) => setRepShown(rep, targetResidues(), false),
   shownCount: (rep) => shownByRep.get(rep).size,
-  // state of a representation across the schemes it is drawn in
-  layerState(rep) {
-    const states = layersOfRep(rep).map((layer) => layer.state);
+  // state of a representation across the schemes it is drawn in; with
+  // `hydrogens`, of its hydrogen overlays
+  layerState(rep, hydrogens = false) {
+    const states = layersOfRep(rep, hydrogens).map((layer) => layer.state);
     if (states.length === 0) return "unloaded";
     return ["loading", "missing"].find((state) => states.includes(state)) ?? "ready";
   },
@@ -2588,8 +2722,8 @@ window.vrPymolDebug = {
   schemeOf: (key) => schemeOfKey(key),
   // {total, visible, transparent} triangle counts of a loaded layer
   // (`visible` includes the see-through ones)
-  layerTriangles(rep) {
-    const parts = layersOfRep(rep).flatMap((layer) => layer.parts);
+  layerTriangles(rep, hydrogens = false) {
+    const parts = layersOfRep(rep, hydrogens).flatMap((layer) => layer.parts);
     return {
       total: parts.reduce((sum, part) => sum + part.owner.length, 0),
       visible: parts.reduce((sum, part) => sum + part.visibleTriangles, 0),
@@ -2729,6 +2863,11 @@ window.vrPymolDebug = {
     return measurementGroup;
   },
   // H-bonds of the selection (or everything); both return a promise
+  showHydrogens: () => setHydrogensShown(targetResidues(), true),
+  hideHydrogens: () => setHydrogensShown(targetResidues(), false),
+  get hydrogens() {
+    return { shownFor: hydrogenKeys.size, loaded: sceneHydrogens ? sceneHydrogens.length : null };
+  },
   showHbonds: () => setHbondsShown(targetResidues(), true),
   hideHbonds: () => setHbondsShown(targetResidues(), false),
   get hbonds() {
@@ -2736,6 +2875,7 @@ window.vrPymolDebug = {
       pairs: hbondPairs ? hbondPairs.length : null,
       shown: shownHbonds.size,
       dashes: hbondDashes ? hbondDashes.count : 0,
+      lengths: hbondDashes ? hbondLengths.map((length) => Number(length.toFixed(2))) : [],
       shownPairs: (hbondPairs || [])
         .filter((pair) => shownHbonds.has(pair.key))
         .map((pair) => [describeAtom(pair.a), describeAtom(pair.b)]),

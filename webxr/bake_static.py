@@ -57,6 +57,7 @@ def bake(out_dir, molecules=MOLECULES, reps=REPS, colors=COLORS):
     baked_dir = os.path.join(out_dir, "baked")
     os.makedirs(os.path.join(baked_dir, "atoms"))
     os.makedirs(os.path.join(baked_dir, "hbonds"))
+    os.makedirs(os.path.join(baked_dir, "hydrogens"))
     # Pages runs Jekyll by default, which skips some paths; nothing here needs it.
     open(os.path.join(out_dir, ".nojekyll"), "w").close()
 
@@ -78,9 +79,25 @@ def bake(out_dir, molecules=MOLECULES, reps=REPS, colors=COLORS):
                 files[f"{molecule}|{rep}|{color}"] = f"baked/{name}"
                 print(f"[{done}/{total}] {name} ({time.time() - start:.1f}s)", flush=True)
 
+        # The polar hydrogens PyMOL added, as overlay layers for the
+        # representations that draw atoms.
+        for rep in reps:
+            if rep not in server.HYDROGEN_REPS:
+                continue
+            for color in colors:
+                server.rebuild_scene(molecule, rep, color=color, hydrogens_only=True)
+                if not has_geometry(server.GLTF_PATH):
+                    continue  # no N-H or O-H in this molecule
+                name = f"{molecule}__{_slug(rep)}__{color}__H.glb"
+                pack_glb(server.GLTF_PATH, os.path.join(baked_dir, name))
+                files[f"{molecule}|{rep}|{color}|H"] = f"baked/{name}"
+        print(f"{molecule}: hydrogen layers done", flush=True)
+
         atoms = server.atom_table(server._get_session())
         with open(os.path.join(baked_dir, "atoms", f"{molecule}.json"), "w") as f:
             json.dump(atoms, f, separators=(",", ":"))
+        with open(os.path.join(baked_dir, "hydrogens", f"{molecule}.json"), "w") as f:
+            json.dump(server.hydrogen_table(server._get_session()), f, separators=(",", ":"))
         with open(os.path.join(baked_dir, "hbonds", f"{molecule}.json"), "w") as f:
             json.dump(server.hbond_pairs(server._get_session()), f, separators=(",", ":"))
 
@@ -91,6 +108,7 @@ def bake(out_dir, molecules=MOLECULES, reps=REPS, colors=COLORS):
         "files": files,
         "atoms": {m: f"baked/atoms/{m}.json" for m in molecules},
         "hbonds": {m: f"baked/hbonds/{m}.json" for m in molecules},
+        "hydrogens": {m: f"baked/hydrogens/{m}.json" for m in molecules},
     }
     with open(os.path.join(baked_dir, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=1)

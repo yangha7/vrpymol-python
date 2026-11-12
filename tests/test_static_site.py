@@ -262,8 +262,8 @@ def test_quest3_emulator_trigger_selects_and_a_button_toggles_sequence(static_si
         # selected (by the trigger above), only that residue's bonds show.
         page.evaluate("() => vrPymolDebug.showHbonds()")
         hbonds = page.evaluate("() => vrPymolDebug.hbonds")
-        assert hbonds["pairs"] == 37  # crambin, see test_measure_and_hbonds.py
-        assert 0 < hbonds["shown"] < 37 and hbonds["dashes"] >= hbonds["shown"], hbonds
+        assert hbonds["pairs"] == 38  # crambin, see test_measure_and_hbonds.py
+        assert 0 < hbonds["shown"] < 38 and hbonds["dashes"] >= hbonds["shown"], hbonds
 
         # Paint and see-through restyle the baked layers in the page too
         # (their vertex colours are 8-bit, unlike the live server's export).
@@ -276,12 +276,21 @@ def test_quest3_emulator_trigger_selects_and_a_button_toggles_sequence(static_si
         sticks = page.evaluate("() => vrPymolDebug.layerTriangles('sticks')")
         assert sticks["transparent"] == sticks["visible"] > 0
 
-        # B on the controller undoes the last change (the opacity).
+        # Polar hydrogens come from baked overlay files and a baked table.
+        page.evaluate("() => vrPymolDebug.showHydrogens()")
+        page.wait_for_function("() => vrPymolDebug.layerState('sticks', true) === 'ready'", timeout=10000)
+        overlay = page.evaluate("() => vrPymolDebug.layerTriangles('sticks', true)")
+        assert 0 < overlay["visible"] < overlay["total"], overlay
+        page.wait_for_function("() => vrPymolDebug.hydrogens.loaded === 68", timeout=5000)
+        page.evaluate("() => vrPymolDebug.hideHydrogens()")
+        assert page.evaluate("() => vrPymolDebug.hydrogens.shownFor") == 0
+
+        # B on the controller undoes the last change (hiding the hydrogens).
         assert not page.evaluate("() => vrPymolDebug.history.canRedo")
         page.evaluate("() => __xrDevice.controllers.right.updateButtonValue('b-button', 1)")
         page.wait_for_function("() => vrPymolDebug.history.canRedo", timeout=5000)
         page.evaluate("() => __xrDevice.controllers.right.updateButtonValue('b-button', 0)")
-        assert page.evaluate("() => vrPymolDebug.layerTriangles('sticks').transparent") == 0
+        assert page.evaluate("() => vrPymolDebug.hydrogens.shownFor") == 1
         assert page.evaluate("() => vrPymolDebug.sequencePanel.visible")  # B is not the menu button
 
         # A hides the board, A again brings it back.

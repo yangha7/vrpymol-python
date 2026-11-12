@@ -27,7 +27,8 @@ PyMOL's own OBJ/COLLADA export bakes spheres/cartoons into degenerate or bulky m
 - **Size controls**: stick radius, sphere scale (real `cmd.set` settings).
 - **Show/hide hydrogens and waters.**
 - **Measuring tools**: distance (2 atoms), angle (3) and dihedral (4), picked with the trigger in VR or a click on desktop, drawn on the molecule with a value label that keeps a readable size at any zoom. Values match PyMOL's `get_distance` / `get_angle` / `get_dihedral`. While a measuring tool is active the atom under the ray is highlighted before you pick it.
-- **H-bonds**: PyMOL's own polar-contact finder (`cmd.find_pairs`, hydrogen-bond mode, waters excluded), drawn as yellow dashes for the selection or the whole molecule.
+- **H-bonds**: PyMOL's own "find polar contacts" (`cmd.distance`, mode 2, waters excluded), drawn as yellow dashes for the selection or the whole molecule.
+- **H atoms**: crystal structures carry no hydrogens, so PyMOL adds the polar ones (on N and O, `h_add`) when a molecule is loaded. "H atoms" shows them on sticks, ball and stick, lines or spheres, and each H-bond dash then runs from the hydrogen to its acceptor — a G–C pair shows its three hydrogen bonds, an A–T pair its two.
 - **Multiple objects at once**: load several molecules into the same scene via the "additional objects" panel — auto-arranged so they don't overlap.
 - **Multiple states / movie frames**: a real `cmd.frame` slider appears for multi-state molecules (e.g. NMR ensembles — try `1le0`, a real 20-model structure).
 - **Residue selection**: point at the molecule to select a residue, or pick residues (click one, sweep for a range) in a sequence window. Selected atoms get pink markers and the selection is shown as a PyMOL expression (`chain A and resi 6-18`). Works in the static build too.
@@ -61,7 +62,7 @@ It prints an HTTPS URL (WebXR requires a secure context, so the server terminate
 
 A serverless build is published at **https://anpigzhao-jpg.github.io/vrpymol-python/** — open it in the Meta Quest Browser and tap "Enter VR". Nothing needs to run on your computer.
 
-Since PyMOL can't run inside a browser, the static build is pre-baked: `webxr/bake_static.py` runs the same real-PyMOL export pipeline ahead of time for every molecule × representation × color scheme in a fixed grid, compresses each scene to a quantized `.glb` (`vr_pymol/glb_pack.py`), and writes a per-molecule atom table and H-bond list, so selection, measuring and H-bonds work without a server. Seven representations are baked (cartoon, sticks, ball and stick, spheres, lines, ribbon, surface) and can be mixed per selection exactly as with the live server; nonbonded, nb_spheres, mesh and dots, extra objects, NMR frames and the size/cartoon sliders need the live server above.
+Since PyMOL can't run inside a browser, the static build is pre-baked: `webxr/bake_static.py` runs the same real-PyMOL export pipeline ahead of time for every molecule × representation × color scheme in a fixed grid, compresses each scene to a quantized `.glb` (`vr_pymol/glb_pack.py`), and writes a per-molecule atom table, hydrogen table, hydrogen overlay layers and H-bond list, so selection, measuring, hydrogens and H-bonds work without a server. Seven representations are baked (cartoon, sticks, ball and stick, spheres, lines, ribbon, surface) and can be mixed per selection exactly as with the live server; nonbonded, nb_spheres, mesh and dots, extra objects, NMR frames and the size/cartoon sliders need the live server above.
 
 Rebuild and publish:
 

@@ -30,21 +30,56 @@ def test_hbonds_endpoint_returns_pymols_pairs_once_each(client):
     client.get("/api/scene?molecule=1crn&rep=cartoon")
     atoms = {a["index"]: a for a in client.get("/api/atoms").get_json()["atoms"]}
     pairs = client.get("/api/hbonds").get_json()["pairs"]
-    assert len(pairs) == 37
-    assert len({(a, i, b, j) for a, i, b, j in pairs}) == 37
-    assert not {(b, j, a, i) for a, i, b, j in pairs} & {(a, i, b, j) for a, i, b, j in pairs}
+    # PyMOL's "find polar contacts", through the hydrogens it added
+    assert len(pairs) == 38
+    ends = [(a, i, b, j) for a, i, b, j, _ in pairs]
+    assert len(set(ends)) == 38
+    assert not {(b, j, a, i) for a, i, b, j in ends} & set(ends)
+    # every bond is reported from a hydrogen, bonded to the donor listed first
+    hydrogens = {h["index"]: h for h in client.get("/api/hydrogens").get_json()["hydrogens"]}
+    for _, donor, _, _, hydrogen in pairs:
+        assert hydrogens[hydrogen]["parent"] == donor
     named = {
         frozenset((f"{atoms[i]['resn']}{atoms[i]['resi']}.{atoms[i]['name']}",
                    f"{atoms[j]['resn']}{atoms[j]['resi']}.{atoms[j]['name']}"))
-        for _, i, _, j in pairs
+        for _, i, _, j, _ in pairs
     }
     # the antiparallel sheet's N-H...O=C pair between strands 1-4 and 32-35,
     # and the first turn of the helix starting at residue 7
     assert frozenset(("THR1.N", "ILE35.O")) in named
     assert frozenset(("THR1.O", "ILE35.N")) in named
     assert frozenset(("ILE7.O", "SER11.N")) in named
-    for _, i, _, j in pairs:
+    for _, i, _, j, _ in pairs:
         assert atoms[i]["element"] in "NO" and atoms[j]["element"] in "NO"
+
+
+def test_watson_crick_pairs_get_their_textbook_hydrogen_bonds(client):
+    """The check `cmd.find_pairs` failed: G-C has three hydrogen bonds
+    (N1-H...N3, N2-H...O2, N4-H...O6) and A-T two (N6-H...O4, N3-H...N1)."""
+    client.get("/api/scene?molecule=1bna&export=0")
+    atoms = {a["index"]: a for a in client.get("/api/atoms").get_json()["atoms"]}
+    hydrogens = {h["index"]: h for h in client.get("/api/hydrogens").get_json()["hydrogens"]}
+    pairs = client.get("/api/hbonds").get_json()["pairs"]
+
+    def between(residue_a, residue_b):
+        found = {}
+        for _, i, _, j, h in pairs:
+            a, b = atoms[i], atoms[j]
+            if {(a["chain"], a["resi"]), (b["chain"], b["resi"])} == {residue_a, residue_b}:
+                # donor atom -> acceptor atom, and the H...acceptor distance
+                import math
+
+                found[(f"{a['resn']}.{a['name']}", f"{b['resn']}.{b['name']}")] = math.dist(
+                    hydrogens[h]["coord"], b["coord"]
+                )
+        return found
+
+    gc = between(("A", "4"), ("B", "21"))
+    assert set(gc) == {("DG.N1", "DC.N3"), ("DG.N2", "DC.O2"), ("DC.N4", "DG.O6")}
+    at = between(("A", "6"), ("B", "19"))
+    assert set(at) == {("DA.N6", "DT.O4"), ("DT.N3", "DA.N1")}
+    # hydrogen to acceptor: the 1.6-2.2 A of a real hydrogen bond
+    assert all(1.5 < distance < 2.3 for distance in [*gc.values(), *at.values()])
 
 
 def _pick(page, atom):

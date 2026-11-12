@@ -49,6 +49,15 @@ BALL_AND_STICK_SIZES = {"stick_radius": 0.11, "sphere_scale": 0.25}
 # explicitly on every export so one export's sizes never carry into the next.
 PYMOL_DEFAULT_SIZES = {"stick_radius": 0.25, "sphere_scale": 1.0}
 
+# Crystal structures carry no hydrogens, so PyMOL adds the polar ones (on N
+# and O -- the ones hydrogen bonds are made with) to every object as it is
+# loaded. They live in the session under this named selection and are left
+# out of everything -- the atom table, picking, the normal layers -- except
+# the "hydrogens only" layers the frontend overlays on request.
+ADDED_H = "added_h"
+# Representations a hydrogens-only layer exists for: the ones that draw atoms.
+HYDROGEN_REPS = ("sticks", BALL_AND_STICK, "spheres", "lines")
+
 DEFAULT_MOLECULE = "1crn"
 DEFAULT_REP = "cartoon"
 DEFAULT_COLOR = "default"
@@ -109,6 +118,7 @@ _display_settings = {
     "cartoon_flat_sheets": True,
     "cartoon_smooth_loops": False,
     "frame": 1,
+    "hydrogens_only": False,
 }
 
 
@@ -117,6 +127,30 @@ def _get_session():
     if _session is None:
         _session = PymolSession()
     return _session
+
+
+def _added_h(session):
+    """The name of the added-hydrogens selection, created empty if this
+    session has none yet."""
+    if ADDED_H not in session.cmd.get_names("selections"):
+        session.cmd.select(ADDED_H, "none", enable=0)
+    return ADDED_H
+
+
+def _add_polar_hydrogens(session, name):
+    """Have PyMOL add hydrogens to object `name`'s N and O atoms (`h_add`,
+    placed from bonding geometry) and record them in `ADDED_H`.
+
+    Waters are skipped: PyMOL can only guess which way a water's hydrogens
+    point. The added atoms are flagged "ignore" so they don't change the
+    molecular surface computed for the heavy atoms.
+    """
+    added = _added_h(session)
+    session.cmd.select("_before_h_add", name, enable=0)
+    session.cmd.h_add(f"{name} and (elem N+O) and not solvent")
+    session.cmd.select(added, f"({added}) or ({name} and not _before_h_add)", enable=0)
+    session.cmd.delete("_before_h_add")
+    session.cmd.flag("ignore", added, "set")
 
 
 def _export_current_scene(session, settings):
@@ -142,8 +176,18 @@ def _export_current_scene(session, settings):
     session.cmd.set("cartoon_flat_sheets", int(settings["cartoon_flat_sheets"]))
     session.cmd.set("cartoon_smooth_loops", int(settings["cartoon_smooth_loops"]))
     session.cmd.hide("everything")
-    for one_rep in reps:
-        session.cmd.show(one_rep)
+    added = _added_h(session)
+    if settings.get("hydrogens_only"):
+        # Just the added hydrogens, in this representation: each hydrogen,
+        # and for sticks and lines the atom it is bonded to as well, since
+        # PyMOL draws a bond only when both of its ends are shown.
+        with_parents = f"{added} or (neighbor {added})"
+        for one_rep in reps:
+            session.cmd.show(one_rep, added if one_rep == "spheres" else with_parents)
+    else:
+        for one_rep in reps:
+            session.cmd.show(one_rep)
+        session.cmd.hide("everything", added)
     _COLOR_SCHEMES[settings["color"]](session)
     if not settings["hydrogens"]:
         session.cmd.hide("everything", "hydro")
@@ -174,6 +218,7 @@ def rebuild_scene(
     cartoon_smooth_loops=False,
     frame=1,
     export=True,
+    hydrogens_only=False,
 ):
     """Replace the *entire* scene with just `molecule` (single-object mode,
     the original behavior, object always named "mol") and show `rep` (one or
@@ -193,6 +238,9 @@ def rebuild_scene(
     off. `frame` (real PyMOL movie frame) only matters for multi-state
     molecules (e.g. NMR ensembles); harmless default of 1 for every
     single-state fixture.
+
+    `hydrogens_only` exports just the added polar hydrogens in `rep` (one
+    of `HYDROGEN_REPS`), the overlay the frontend shows for "H atoms".
 
     `export=False` loads the molecule and records the settings without
     exporting anything, for callers that fetch representations one at a time
@@ -217,12 +265,14 @@ def rebuild_scene(
         cartoon_flat_sheets=cartoon_flat_sheets,
         cartoon_smooth_loops=cartoon_smooth_loops,
         frame=frame,
+        hydrogens_only=hydrogens_only,
     )
     with _lock:
         session = _get_session()
         session.load(pdb_path)
         _objects.clear()
         _objects["mol"] = molecule
+        _add_polar_hydrogens(session, "mol")
         _default_colors.clear()
         _capture_default_colors(session, "mol")
         _display_settings.update(settings)
@@ -242,6 +292,7 @@ def add_object_to_scene(molecule):
         session = _get_session()
         name = session.add_object(pdb_path, base_name=molecule)
         _objects[name] = molecule
+        _add_polar_hydrogens(session, name)
         _capture_default_colors(session, name)
         max_states = _export_current_scene(session, _display_settings)
     return name, max_states
@@ -393,9 +444,16 @@ def api_layer():
     color = request.args.get("color", _display_settings["color"])
     if color not in _COLOR_SCHEMES:
         return jsonify({"ok": False, "error": f"unknown color scheme {color!r}"}), 400
+    # h=1: only the added polar hydrogens, to overlay on the normal layer
+    hydrogens_only = request.args.get("h") == "1"
+    if hydrogens_only and rep not in HYDROGEN_REPS:
+        return jsonify({"ok": False, "error": f"no hydrogens layer for {rep!r}"}), 400
     with _lock:
         session = _get_session()
-        _export_current_scene(session, {**_display_settings, "rep": rep, "color": color})
+        _export_current_scene(
+            session,
+            {**_display_settings, "rep": rep, "color": color, "hydrogens_only": hydrogens_only},
+        )
         if not has_geometry(GLTF_PATH):
             return jsonify({"ok": False, "error": f"nothing to draw as {rep}"}), 404
         with open(GLTF_PATH, "rb") as f:
@@ -450,11 +508,15 @@ def atom_table(session: PymolSession, state: int = 1) -> list[dict]:
     file carries. `state` is the 1-based PyMOL state to read coordinates
     from, clamped per object (a single-state object next to an NMR ensemble
     stays on its only state, as it does in the exported scene).
+
+    The polar hydrogens PyMOL added on load are not part of it; see
+    `hydrogen_table`.
     """
     atoms = []
+    heavy = f"not {_added_h(session)}"
     for object_name in session.cmd.get_object_list():
         object_state = max(1, min(state, session.cmd.count_states(object_name)))
-        for atom in session.cmd.get_model(object_name, state=object_state).atom:
+        for atom in session.cmd.get_model(f"{object_name} and {heavy}", state=object_state).atom:
             atoms.append(
                 {
                     "object": object_name,
@@ -471,24 +533,72 @@ def atom_table(session: PymolSession, state: int = 1) -> list[dict]:
 
 
 def hbond_pairs(session: PymolSession, state: int = 1) -> list[list]:
-    """Hydrogen-bonded atom pairs, as PyMOL itself finds them.
+    """Hydrogen bonds, as PyMOL's own "find polar contacts" finds them.
 
-    Uses `cmd.find_pairs(..., mode=1)`, PyMOL's hydrogen-bond geometry test
-    on N and O atoms, at its documented defaults (3.5 Angstrom cutoff,
-    45 degree angle). It works from heavy atoms, so structures without
-    hydrogens are fine. Waters are left out: on a hydrated structure they
-    add hundreds of contacts that bury the ones inside the molecule.
+    That is `cmd.distance(..., mode=2)`, the command behind the GUI's
+    Action > find > polar contacts. With the polar hydrogens PyMOL added on
+    load it reports most bonds as hydrogen...acceptor. (`cmd.find_pairs` in
+    hydrogen-bond mode looked equivalent but is not: on a G-C base pair it
+    returns N1-O2 and O6-N3 and misses the real N2-H...O2 and N4-H...O6.)
+    Waters are left out: on a hydrated structure they add hundreds of
+    contacts that bury the ones inside the molecule.
 
-    Returns `[object_a, index_a, object_b, index_b]` rows, each pair once
-    (PyMOL reports every bond from both ends), with indices matching the
-    atom table's `index`.
+    Returns `[object_a, index_a, object_b, index_b, hydrogen]` rows, each
+    bond once. `a` and `b` are the two heavy atoms (N or O), by the atom
+    table's `index`. Where PyMOL reported the bond from a hydrogen, `a` is
+    the donor that hydrogen is bonded to and `hydrogen` is the hydrogen's
+    `index` (see `hydrogen_table`); otherwise `hydrogen` is None.
     """
-    selection = "(elem N+O) and not solvent"
-    found = session.cmd.find_pairs(
-        selection, selection, state1=state, state2=state, mode=1, cutoff=3.5, angle=45
-    )
-    unique = {tuple(sorted((tuple(a), tuple(b)))) for a, b in found}
-    return [[a[0], a[1], b[0], b[1]] for a, b in sorted(unique)]
+    cmd = session.cmd
+    polar = "not solvent"
+    cmd.delete("_polar_contacts")
+    cmd.distance("_polar_contacts", polar, polar, mode=2, state=state)
+
+    # A distance object holds only coordinates, two points per contact, so
+    # each end is matched back to the atom at that position.
+    atom_at = {}
+    parent = {}
+    added = {(a.model, a.index) for a in cmd.get_model(_added_h(session)).atom}
+    for object_name in cmd.get_object_list():
+        object_state = max(1, min(state, cmd.count_states(object_name)))
+        model = cmd.get_model(object_name, state=object_state)
+        for atom in model.atom:
+            atom_at[tuple(round(c, 3) for c in atom.coord)] = (object_name, atom.index)
+        for bond in model.bond:
+            a, b = (model.atom[i] for i in bond.index)
+            if (object_name, a.index) in added:
+                parent[(object_name, a.index)] = (object_name, b.index)
+            elif (object_name, b.index) in added:
+                parent[(object_name, b.index)] = (object_name, a.index)
+
+    session_data = cmd.get_session("_polar_contacts", 1, 1, 0, 0)
+    cmd.delete("_polar_contacts")
+    coords = []
+    for entry in session_data.get("names", []):
+        if entry and entry[0] == "_polar_contacts":
+            for dist_set in entry[5][2]:  # one per state
+                if dist_set:
+                    coords.extend(dist_set[1] or [])
+
+    rows = set()
+    for k in range(0, len(coords) - 5, 6):
+        ends = [atom_at.get(tuple(round(c, 3) for c in coords[k + o : k + o + 3])) for o in (0, 3)]
+        if None in ends:
+            continue
+        hydrogens = [end for end in ends if end in added]
+        if len(hydrogens) == 2:
+            continue
+        if hydrogens:
+            hydrogen = hydrogens[0]
+            donor = parent.get(hydrogen)
+            acceptor = ends[1] if ends[0] == hydrogen else ends[0]
+            if donor is None:
+                continue
+            rows.add((donor[0], donor[1], acceptor[0], acceptor[1], hydrogen[1]))
+        else:
+            first, second = sorted(ends)
+            rows.add((first[0], first[1], second[0], second[1], None))
+    return [list(row) for row in sorted(rows, key=lambda r: (r[0], r[1], r[2], r[3], r[4] or 0))]
 
 
 @app.route("/api/hbonds")
@@ -499,6 +609,53 @@ def api_hbonds():
         state = max(1, min(_display_settings["frame"], max_states))
         pairs = hbond_pairs(session, state)
     return jsonify({"ok": True, "pairs": pairs})
+
+
+def hydrogen_table(session: PymolSession, state: int = 1) -> list[dict]:
+    """The polar hydrogens PyMOL added on load, in the atom table's format
+    plus `parent`: the `index` of the N or O each is bonded to (same object).
+    `coord` in Angstroms, model frame.
+    """
+    hydrogens = []
+    added = _added_h(session)
+    for object_name in session.cmd.get_object_list():
+        object_state = max(1, min(state, session.cmd.count_states(object_name)))
+        added_indices = {a.index for a in session.cmd.get_model(f"{object_name} and {added}").atom}
+        if not added_indices:
+            continue
+        model = session.cmd.get_model(object_name, state=object_state)
+        parent = {}
+        for bond in model.bond:
+            a, b = (model.atom[i] for i in bond.index)
+            if a.index in added_indices:
+                parent[a.index] = b.index
+            elif b.index in added_indices:
+                parent[b.index] = a.index
+        for atom in model.atom:
+            if atom.index not in added_indices:
+                continue
+            hydrogens.append(
+                {
+                    "object": object_name,
+                    "index": atom.index,
+                    "name": atom.name,
+                    "resn": atom.resn,
+                    "resi": atom.resi,
+                    "chain": atom.chain,
+                    "element": atom.symbol,
+                    "coord": [round(c, 3) for c in atom.coord],
+                    "parent": parent.get(atom.index),
+                }
+            )
+    return hydrogens
+
+
+@app.route("/api/hydrogens")
+def api_hydrogens():
+    with _lock:
+        session = _get_session()
+        hydrogens = hydrogen_table(session, _display_settings["frame"])
+    return jsonify({"ok": True, "hydrogens": hydrogens})
 
 
 @app.route("/api/atoms")
@@ -548,7 +705,7 @@ def api_pick():
         best_object = None
         best_dist = None
         for object_name in session.cmd.get_object_list():
-            for atom in session.cmd.get_model(object_name).atom:
+            for atom in session.cmd.get_model(f"{object_name} and not {_added_h(session)}").atom:
                 dist = (
                     (atom.coord[0] - x) ** 2 + (atom.coord[1] - y) ** 2 + (atom.coord[2] - z) ** 2
                 )
