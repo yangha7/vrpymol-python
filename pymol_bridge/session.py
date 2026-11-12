@@ -16,6 +16,12 @@ class PymolSession:
 
     def load(self, path, object_name="mol"):
         self.cmd.delete("all")
+        # PyMOL hands each newly loaded object the next carbon colour in its
+        # auto_color cycle (green, cyan, light magenta, ...) and deleting
+        # objects does not rewind it. This load starts a fresh scene, so the
+        # cycle starts over too: the first object always gets green carbons,
+        # as in a newly started PyMOL. Objects added later still cycle.
+        self.cmd.set("auto_color_next", 0)
         self.cmd.load(path, object_name)
         self._next_x = 0.0
         return object_name

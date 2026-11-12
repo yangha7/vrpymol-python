@@ -141,3 +141,16 @@ def test_default_colouring_comes_back_after_another_scheme():
         assert len({tuple(round(c, 2) for c in cyl["color"]) for cyl in parse_wrl(WRL_PATH)[1]}) == 1
         server._export_current_scene(session, {**server._display_settings, "color": "default"})
         assert {tuple(round(c, 2) for c in cyl["color"]) for cyl in parse_wrl(WRL_PATH)[1]} == by_element
+
+
+def test_default_carbon_colour_does_not_depend_on_how_many_loads_came_before():
+    # PyMOL gives each newly loaded object the next carbon colour in a cycle
+    # (green, cyan, light magenta, yellow, salmon, white, ...). The viewer
+    # reloads the molecule on every switch -- and the static bake once per
+    # representation and scheme -- so "by element" came out with a different
+    # carbon colour depending on what had been loaded earlier.
+    green = (0.2, 1.0, 0.2)
+    for _ in range(3):
+        _, cylinders, _ = _rebuild_and_parse(molecule="1crn", rep="sticks")
+        colors = {tuple(round(c, 2) for c in cyl["color"]) for cyl in cylinders}
+        assert green in colors, colors
