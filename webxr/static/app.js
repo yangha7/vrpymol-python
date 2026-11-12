@@ -2,6 +2,7 @@ import * as THREE from "three";
 import { GLTFLoader } from "./vendor/jsm/loaders/GLTFLoader.js";
 import { OrbitControls } from "./vendor/jsm/controls/OrbitControls.js";
 import { VRButton } from "./vendor/jsm/webxr/VRButton.js";
+import { mergeVertices } from "./vendor/jsm/utils/BufferGeometryUtils.js";
 
 const hud = document.getElementById("hud");
 
@@ -272,6 +273,43 @@ function residueAssigner(rep) {
   };
 }
 
+// Round things -- atoms, bonds, molecular surfaces -- are exported as
+// triangle meshes with no normals, which three.js then lights one flat
+// facet at a time. Giving each vertex the average normal of the triangles
+// around it shades them as the smooth shapes they stand for. Cartoon and
+// ribbon are left faceted: their meshes have real sharp edges (the rims of
+// strands and arrows) that averaging would smear.
+const SMOOTH_REPS = new Set([
+  "sticks",
+  "ball_and_stick",
+  "spheres",
+  "lines",
+  "nonbonded",
+  "nb_spheres",
+  "dots",
+  "surface",
+]);
+
+function smoothLayer(root) {
+  root.traverse((object) => {
+    if (!object.isMesh) return;
+    let geometry = object.geometry;
+    // Averaging needs neighbouring triangles to share vertices. The static
+    // build's files are already welded; the live server's sticks are
+    // triangle soup (and carry an unused texture coordinate per vertex that
+    // would stop identical vertices from merging).
+    if (!geometry.index) {
+      geometry.deleteAttribute("uv");
+      geometry = mergeVertices(geometry);
+      object.geometry.dispose();
+      object.geometry = geometry;
+    }
+    geometry.computeVertexNormals();
+    object.material.flatShading = false; // GLTFLoader turns it on when a mesh has no normals
+    object.material.needsUpdate = true;
+  });
+}
+
 // Work out which residue every triangle of a freshly loaded layer belongs
 // to, and give each mesh an index buffer that can be rewritten to draw any
 // subset of them.
@@ -508,6 +546,7 @@ function loadLayer(rep, scheme) {
       if (layers.get(key) !== layer) return;
       layer.root = gltf.scene;
       layer.root.name = `layer-${rep}-${scheme}`;
+      if (SMOOTH_REPS.has(rep)) smoothLayer(layer.root);
       layer.parts = buildLayerParts(layer.root, rep);
       currentModel.add(layer.root);
       layer.state = "ready";

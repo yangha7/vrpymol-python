@@ -207,3 +207,77 @@ def test_ball_and_stick_is_thin_sticks_plus_small_spheres(live_server):
         assert drawn["visible"] == drawn["total"] > 0
         browser.close()
     assert not page_errors, f"uncaught JS errors: {page_errors}"
+
+
+def test_spheres_and_balls_are_shaded_smooth(live_server):
+    """Atom spheres must carry per-vertex normals pointing straight out from
+    the atom centre, so they are lit as spheres and not facet by facet."""
+    outward_js = """([rep, atoms]) => {
+        const three = window.__three_for_tests__;
+        const model = window.vrPymolDebug.model;
+        model.updateMatrixWorld(true);
+        const toModel = model.matrixWorld.clone().invert();
+        const p = new three.Vector3(), n = new three.Vector3();
+        let worst = 1, checked = 0, flat = 0, meshes = 0;
+        model.traverse((mesh) => {
+            let layer = mesh;
+            while (layer && !layer.name.startsWith(`layer-${rep}-`)) layer = layer.parent;
+            if (!layer || !mesh.isMesh || !mesh.visible) return;
+            meshes += 1;
+            if (mesh.material.flatShading) flat += 1;
+            const position = mesh.geometry.attributes.position;
+            const normal = mesh.geometry.attributes.normal;
+            if (!normal) { worst = -1; return; }
+            const matrix = new three.Matrix4().multiplyMatrices(toModel, mesh.matrixWorld);
+            const step = Math.max(1, Math.floor(position.count / 400));
+            for (let i = 0; i < position.count; i += step) {
+                p.fromBufferAttribute(position, i).applyMatrix4(matrix);
+                n.fromBufferAttribute(normal, i).normalize();
+                // centre of the sphere this vertex is on: the atom at its radius
+                let best = null, bestMiss = Infinity;
+                for (const [x, y, z, r] of atoms) {
+                    const miss = Math.abs(Math.hypot(p.x - x, p.y - y, p.z - z) - r);
+                    if (miss < bestMiss) { bestMiss = miss; best = [x, y, z]; }
+                }
+                if (bestMiss > 0.05) continue;  // a stick vertex, not on a sphere
+                const out = new three.Vector3(p.x - best[0], p.y - best[1], p.z - best[2]).normalize();
+                worst = Math.min(worst, out.dot(n));
+                checked += 1;
+            }
+        });
+        return { worst, checked, flat, meshes };
+    }"""
+    vdw = {"C": 1.7, "N": 1.55, "O": 1.52, "S": 1.8}
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page(viewport={"width": 1200, "height": 900}, ignore_https_errors=True)
+        page_errors = []
+        page.on("pageerror", lambda exc: page_errors.append(str(exc)))
+        page.goto(live_server, wait_until="networkidle")
+        page.evaluate("() => window.vrPymolApplySelection()")
+        page.wait_for_function("() => window.vrPymolDebug.sequence.join('').length === 46", timeout=10000)
+        page.evaluate("async () => { window.__three_for_tests__ = await import('three'); }")
+        atoms = page.evaluate("async () => (await (await fetch('/api/atoms')).json()).atoms")
+        for rep, scale in (("ball_and_stick", 0.25), ("spheres", 1.0)):
+            page.evaluate(f"() => window.vrPymolDebug.showRep('{rep}')")
+            _wait_ready(page, rep)
+            spheres = [[*a["coord"], vdw[a["element"]] * scale] for a in atoms]
+            result = page.evaluate(outward_js, [rep, spheres])
+            assert result["meshes"] > 0 and result["flat"] == 0, (rep, result)
+            assert result["checked"] > 100, (rep, result)
+            # averaged normals on a faceted sphere are radial to within a few degrees
+            assert result["worst"] > 0.97, (rep, result)
+            page.evaluate(f"() => window.vrPymolDebug.hideRep('{rep}')")
+        # cartoon keeps its facets: its sharp edges are real
+        _wait_ready(page, "cartoon")
+        assert page.evaluate(
+            """() => {
+                let flat = 0;
+                window.vrPymolDebug.model.traverse((o) => {
+                    if (o.isMesh && o.parent && o.material.flatShading) flat += 1;
+                });
+                return flat;
+            }"""
+        ) > 0
+        browser.close()
+    assert not page_errors, f"uncaught JS errors: {page_errors}"

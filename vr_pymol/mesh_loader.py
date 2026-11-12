@@ -51,15 +51,18 @@ def _direct_color_mapper(polydata):
 # they're cheap and get viewed up close.
 LARGE_SPHERE_COUNT = 2000
 # Spheres this small (Angstroms) are the balls of ball-and-stick or dots,
-# not space-filling atoms: a facet on them is a fraction of a stick's width,
-# so 8x6 (~60 triangles) looks the same as 16x16 at an eighth of the size.
+# not space-filling atoms, and there is one per atom on top of the sticks,
+# so they get fewer facets than full-size spheres: 12x8 (~140 triangles),
+# or 10x6 (~80) in large scenes. The frontend shades them smooth; what the
+# facet count still decides is how round the outline is.
 SMALL_SPHERE_RADIUS = 0.8
 
 
 def _sphere_resolution(count, largest_radius):
+    large = count > LARGE_SPHERE_COUNT
     if largest_radius <= SMALL_SPHERE_RADIUS:
-        return (8, 6)
-    return (10, 8) if count > LARGE_SPHERE_COUNT else (16, 16)
+        return (10, 6) if large else (12, 8)
+    return (10, 8) if large else (16, 16)
 
 
 def _sphere_actor(spheres):
