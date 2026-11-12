@@ -456,14 +456,15 @@ function applyLayerMask(layer) {
     }
   }
   for (const part of layer.parts) {
-    // one output per opacity level: [opaque, ghost 1, ghost 2]
-    const outputs = [part.index, part.ghosts[1]?.index, part.ghosts[2]?.index];
-    const counts = [0, 0, 0];
+    // one index buffer per opacity level: the mesh itself for 100%, a
+    // see-through copy (made the first time it is needed) for each other
+    const outputs = OPACITY_LEVELS.map((_, l) => (l === 0 ? part.index : part.ghosts[l]?.index));
+    const counts = OPACITY_LEVELS.map(() => 0);
     for (let t = 0; t < part.owner.length; t++) {
       const ordinal = part.owner[t];
       if (ordinal < 0 || !mask[ordinal]) continue;
       const l = level[ordinal];
-      if (l > 0 && !outputs[l]) {
+      if (!outputs[l]) {
         part.ghosts[l] = makeGhost(part, l);
         outputs[l] = part.ghosts[l].index;
       }
@@ -472,15 +473,16 @@ function applyLayerMask(layer) {
       out[counts[l]++] = part.source[3 * t + 1];
       out[counts[l]++] = part.source[3 * t + 2];
     }
-    const meshes = [part.object, part.ghosts[1]?.mesh, part.ghosts[2]?.mesh];
-    meshes.forEach((mesh, l) => {
+    OPACITY_LEVELS.forEach((_, l) => {
+      const mesh = l === 0 ? part.object : part.ghosts[l]?.mesh;
       if (!mesh) return;
       outputs[l].needsUpdate = true;
       mesh.geometry.setDrawRange(0, counts[l]);
       mesh.visible = counts[l] > 0;
     });
-    part.visibleTriangles = (counts[0] + counts[1] + counts[2]) / 3;
-    part.transparentTriangles = (counts[1] + counts[2]) / 3;
+    const drawn = counts.reduce((sum, count) => sum + count, 0);
+    part.visibleTriangles = drawn / 3;
+    part.transparentTriangles = (drawn - counts[0]) / 3;
     paintPart(part, colorByOrdinal);
   }
 }
@@ -525,6 +527,9 @@ function layerMissing(layer) {
     allResidues.forEach((residue) => shownByRep.get("sticks").add(residue.key));
   }
   layerSettled();
+  // Not something the user did: undo should not step back into asking for
+  // a representation that has nothing to draw.
+  historyAmend = true;
   representationChanged();
 }
 
@@ -609,6 +614,7 @@ function setScheme(scheme) {
 }
 
 function representationChanged() {
+  scheduleHistoryCommit();
   pickableAtoms = null; // what a ray can pick follows what is drawn
   ensureLayers();
   syncRepControls();
@@ -635,7 +641,9 @@ function hideEverything(residues) {
     for (const residue of residues) keys.delete(residue.key);
   }
   representationChanged();
-  if (shownHbonds.size > 0) setHbondsShown(residues, false);
+  // bonds can only be showing if their list is loaded, so this is
+  // immediate and part of the same undo step
+  if (shownHbonds.size > 0 && hbondPairs) applyHbondsShown(hbondPairs, residues, false);
 }
 
 // Reload the scene after the molecule, objects, frame, colouring or an
@@ -660,12 +668,12 @@ async function syncScene() {
     atoms = data.atoms;
     objects = Object.fromEntries(data.objects.map((o) => [o.name, o.molecule]));
   }
-  if (!currentModel || JSON.stringify(objects) !== JSON.stringify(sceneObjects)) {
-    startNewModel(atoms);
-  }
+  const newMolecule = !currentModel || JSON.stringify(objects) !== JSON.stringify(sceneObjects);
+  if (newMolecule) startNewModel(atoms);
   setSceneAtoms(atoms, objects);
   representationChanged();
   refreshHbonds();
+  if (newMolecule) resetHistory(); // undo never reaches back into another molecule
 }
 
 function resetView() {
@@ -996,6 +1004,7 @@ function completeMeasurement(kind, picks) {
   measurements.push({ kind, atoms, value, text });
   measureHud.textContent = `${atoms.map(describeAtom).join(" – ")}: ${text}`;
   requestSequenceRedraw();
+  scheduleHistoryCommit();
 }
 
 // Feed one atom to the active measuring tool.
@@ -1035,6 +1044,7 @@ function clearMeasurements() {
   hoverMarker = null;
   measureHud.textContent = " ";
   requestSequenceRedraw();
+  scheduleHistoryCommit();
 }
 
 function setTool(mode) {
@@ -1218,7 +1228,10 @@ function syncHbondControl() {
 }
 
 async function setHbondsShown(residues, shown) {
-  const pairs = await loadHbondPairs();
+  applyHbondsShown(await loadHbondPairs(), residues, shown);
+}
+
+function applyHbondsShown(pairs, residues, shown) {
   const keys = new Set(residues.map((residue) => residue.key));
   for (const pair of pairs) {
     if (!keys.has(residueKey(pair.a)) && !keys.has(residueKey(pair.b))) continue;
@@ -1228,6 +1241,7 @@ async function setHbondsShown(residues, shown) {
   rebuildHbondDashes();
   syncHbondControl();
   requestSequenceRedraw();
+  scheduleHistoryCommit();
 }
 
 // After the scene reloaded: the pair list is refetched (objects and frames
@@ -1458,6 +1472,7 @@ function selectionChanged() {
   rebuildSelectionMarkers();
   selectionHud.textContent = selectionExpression();
   requestSequenceRedraw();
+  scheduleHistoryCommit();
 }
 
 function setResiduesSelected(list, selected) {
@@ -1563,18 +1578,20 @@ const COLOR_SCHEMES = [
   ["secondary-structure", "2nd struct"],
   ["b-factor", "b-factor"],
 ];
-// Index 0 is opaque; 1 and 2 are the two see-through settings.
-const OPACITY_LEVELS = [1, 0.5, 0.2];
-const OPACITY_LABELS = ["none", "50%", "80%"];
+// How solid a residue is drawn: 100% is fully solid, 25% barely there.
+// Index 0 is the opaque default; the others are drawn see-through.
+const OPACITY_LEVELS = [1, 0.75, 0.5, 0.25];
+const OPACITY_LABELS = ["100%", "75%", "50%", "25%"];
 
 const residueColor = new Map(); // residue key -> THREE.Color painted over the scheme
-const residueOpacity = new Map(); // residue key -> 1 or 2 (index into OPACITY_LEVELS)
+const residueOpacity = new Map(); // residue key -> index into OPACITY_LEVELS, where not 0
 
 function restyleLayers() {
   for (const layer of layers.values()) {
     if (layer.state === "ready") applyLayerMask(layer);
   }
   requestSequenceRedraw();
+  scheduleHistoryCommit();
 }
 
 // `hex` null removes the paint, giving the residues back their scheme colour.
@@ -1620,6 +1637,7 @@ function groupsChanged() {
   groupNameInput.value = activeGroup ? activeGroup.name : "";
   groupNameInput.disabled = !activeGroup;
   layoutSequence(); // the menu has one button per group
+  scheduleHistoryCommit();
 }
 
 function saveGroup() {
@@ -1714,6 +1732,159 @@ document.querySelectorAll("#opacity-buttons button").forEach((button) => {
   button.addEventListener("click", () => {
     setResidueOpacity(targetResidues(), Number(button.dataset.level));
   });
+});
+
+// --- undo / redo ---
+//
+// Everything a button or the trigger can change about how the molecule is
+// presented -- the selection, what is shown in which representation,
+// colouring, opacity, H-bonds, groups, measurements -- is captured as one
+// snapshot after each change, and undo steps back through the snapshots.
+// The view itself (grab, zoom) and the choice of molecule are not part of
+// it; loading a different molecule starts a fresh history.
+
+const HISTORY_LIMIT = 100;
+let history = []; // snapshots as JSON strings, oldest first
+let historyIndex = -1; // the snapshot matching what is on screen
+let historyCommitQueued = false;
+let historyAmend = false; // fold the next change into the current step
+let restoringHistory = false;
+
+function captureState() {
+  return {
+    selected: Array.from(selectedKeys),
+    shown: Object.fromEntries(availableReps.map((rep) => [rep, Array.from(shownByRep.get(rep))])),
+    baseScheme,
+    schemes: Array.from(residueScheme),
+    colors: Array.from(residueColor, ([key, color]) => [key, `#${color.getHexString()}`]),
+    opacity: Array.from(residueOpacity),
+    hbonds: Array.from(shownHbonds),
+    groups: groups.map((group) => ({ name: group.name, keys: Array.from(group.keys) })),
+    activeGroup: activeGroup ? activeGroup.name : null,
+    measurements: measurements.map((m) => ({
+      kind: m.kind,
+      atoms: m.atoms.map((atom) => `${atom.object}|${atom.index}`),
+    })),
+  };
+}
+
+function restoreState(state) {
+  restoringHistory = true;
+  const refill = (target, values) => {
+    target.clear();
+    for (const value of values) target.add(value);
+  };
+  refill(selectedKeys, state.selected);
+  for (const rep of availableReps) refill(shownByRep.get(rep), state.shown[rep] || []);
+  baseScheme = state.baseScheme;
+  colorSelect.value = baseScheme;
+  residueScheme.clear();
+  for (const [key, scheme] of state.schemes) residueScheme.set(key, scheme);
+  residueColor.clear();
+  for (const [key, hex] of state.colors) residueColor.set(key, new THREE.Color(hex));
+  residueOpacity.clear();
+  for (const [key, level] of state.opacity) residueOpacity.set(key, level);
+  groups = state.groups.map((group) => ({ name: group.name, keys: new Set(group.keys) }));
+  activeGroup = groups.find((group) => group.name === state.activeGroup) || null;
+  refill(shownHbonds, state.hbonds);
+
+  const atomByIndex = new Map(sceneAtoms.map((atom) => [`${atom.object}|${atom.index}`, atom]));
+  clearMeasurements();
+  for (const saved of state.measurements) {
+    const atoms = saved.atoms.map((id) => atomByIndex.get(id));
+    if (atoms.some((atom) => !atom)) continue;
+    completeMeasurement(
+      saved.kind,
+      atoms.map((atom) => ({ atom, marker: addMarker(atom.coord, DONE_COLOR) })),
+    );
+  }
+
+  groupsChanged();
+  selectionChanged();
+  representationChanged(); // re-masks, repaints and re-fades every layer
+  // the bond list may not be loaded yet if the scene was reloaded since
+  (shownHbonds.size > 0 ? loadHbondPairs() : Promise.resolve()).then(() => {
+    rebuildHbondDashes();
+    syncHbondControl();
+  });
+  restoringHistory = false;
+}
+
+function commitHistory() {
+  historyCommitQueued = false;
+  // a sweep across the sequence is one step, taken when the trigger lets go
+  if (restoringHistory || seqDrag) return;
+  const snapshot = JSON.stringify(captureState());
+  if (historyIndex >= 0 && snapshot === history[historyIndex]) return;
+  if (historyAmend && historyIndex >= 0) {
+    history[historyIndex] = snapshot;
+  } else {
+    history.length = historyIndex + 1; // a new change discards what could be redone
+    history.push(snapshot);
+    if (history.length > HISTORY_LIMIT) history.shift();
+    historyIndex = history.length - 1;
+  }
+  historyAmend = false;
+  syncHistoryControls();
+}
+
+// Called from every place state changes. The snapshot is taken in a
+// microtask, i.e. once the current button press or trigger pull has
+// finished running: everything one action changed lands in one step, and
+// two actions can never share one however quickly they follow each other.
+function scheduleHistoryCommit() {
+  if (restoringHistory || historyCommitQueued) return;
+  historyCommitQueued = true;
+  queueMicrotask(commitHistory);
+}
+
+function resetHistory() {
+  history = [];
+  historyIndex = -1;
+  commitHistory();
+}
+
+function canUndo() {
+  return historyIndex > 0;
+}
+
+function canRedo() {
+  return historyIndex < history.length - 1;
+}
+
+function stepHistory(direction) {
+  commitHistory(); // anything still pending is a step of its own
+  const target = historyIndex + direction;
+  if (target < 0 || target >= history.length) {
+    hud.textContent = direction < 0 ? "nothing to undo" : "nothing to redo";
+    return false;
+  }
+  historyIndex = target;
+  restoreState(JSON.parse(history[historyIndex]));
+  syncHistoryControls();
+  return true;
+}
+
+const undo = () => stepHistory(-1);
+const redo = () => stepHistory(1);
+
+const undoButton = document.getElementById("undo");
+const redoButton = document.getElementById("redo");
+
+function syncHistoryControls() {
+  undoButton.disabled = !canUndo();
+  redoButton.disabled = !canRedo();
+  requestSequenceRedraw();
+}
+
+undoButton.addEventListener("click", undo);
+redoButton.addEventListener("click", redo);
+window.addEventListener("keydown", (event) => {
+  if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "z") return;
+  if (["INPUT", "SELECT", "TEXTAREA"].includes(event.target.tagName)) return; // let text fields undo typing
+  event.preventDefault();
+  if (event.shiftKey) redo();
+  else undo();
 });
 
 // --- menu window: show/hide buttons and the sequence ---
@@ -1854,6 +2025,11 @@ function menuButtons() {
     return x;
   };
 
+  place(right - 2 * 76 - SEQ_BUTTON_GAP, 12, 76, [
+    { kind: "undo", label: "undo" },
+    { kind: "redo", label: "redo" },
+  ]);
+
   const slots = availableReps.length + 2; // plus "h-bonds", and "everything" on the hide row
   const repWidth = (right - left + SEQ_BUTTON_GAP) / slots - SEQ_BUTTON_GAP;
   rowLabel("show", SEQ_ROW_SHOW);
@@ -1889,7 +2065,7 @@ function menuButtons() {
   ));
   place(x + 8, SEQ_ROW_COLOR, right - x - 8, [{ kind: "unpaint", label: "reset" }]);
 
-  rowLabel("fade", SEQ_ROW_OPACITY); // how see-through: none, 50% or 80%
+  rowLabel("opacity", SEQ_ROW_OPACITY);
   place(left, SEQ_ROW_OPACITY, 76, OPACITY_LABELS.map(
     (label, level) => ({ kind: "opacity", level, label }),
   ));
@@ -1932,6 +2108,10 @@ function describeAction(action) {
         : `trigger on the molecule picks ${TOOL_ATOM_COUNT[action.tool]} atoms to measure a ${action.tool}`;
     case "clearMeasurements":
       return "remove every measurement";
+    case "undo":
+      return canUndo() ? "undo the last change (also the B or Y button)" : "nothing to undo";
+    case "redo":
+      return canRedo() ? "redo the change just undone" : "nothing to redo";
     case "scheme":
       return `colour ${describeTarget()} by ${action.label}`;
     case "paint":
@@ -1940,8 +2120,8 @@ function describeAction(action) {
       return `give ${describeTarget()} back its scheme colour`;
     case "opacity":
       return action.level === 0
-        ? `make ${describeTarget()} solid`
-        : `make ${describeTarget()} ${action.label} see-through`;
+        ? `draw ${describeTarget()} fully solid`
+        : `draw ${describeTarget()} at ${action.label} opacity (see-through)`;
     case "saveGroup":
       return "save the selection as a named group";
     case "renameGroup":
@@ -1985,6 +2165,12 @@ function runMenuAction(action) {
       break;
     case "clearMeasurements":
       clearMeasurements();
+      break;
+    case "undo":
+      undo();
+      break;
+    case "redo":
+      redo();
       break;
     case "scheme":
       setScheme(action.scheme);
@@ -2082,11 +2268,11 @@ function drawSequence() {
   else if (sequenceResidues.length === 0) status = "no sequence loaded";
   else if (count === 0) status = "nothing selected -- buttons act on the whole molecule";
   else status = `${count} residue${count === 1 ? "" : "s"} selected -- buttons act on the selection`;
-  ctx.fillText(status, SEQ_PAD + 90, 28, SEQ_WIDTH - 2 * SEQ_PAD - 90);
+  ctx.fillText(status, SEQ_PAD + 90, 28, SEQ_WIDTH - 2 * SEQ_PAD - 90 - 170); // clear of undo/redo
   ctx.font = "14px monospace";
   ctx.fillStyle = "#9aa6cc";
   ctx.fillText(
-    "trigger: use the tool on the molecule, press a button or residue here | grip: grab | stick: zoom | A/B: hide",
+    "trigger: use the tool on the molecule, press a button or residue here | grip: grab | stick: zoom | A: menu | B: undo",
     SEQ_PAD,
     56,
   );
@@ -2124,13 +2310,13 @@ function drawSequence() {
         (action.kind === "tool" && action.tool === toolMode) ||
         (action.kind === "scheme" && target.some((r) => schemeOfKey(r.key) === action.scheme)) ||
         (action.kind === "opacity" &&
-          action.level > 0 &&
-          target.some((r) => residueOpacity.get(r.key) === action.level)) ||
+          target.some((r) => (residueOpacity.get(r.key) ?? 0) === action.level)) ||
         (action.kind === "recallGroup" && action.group === activeGroup);
       const chainBar = action.kind === "toggleChain";
+      const unavailable = (action.kind === "undo" && !canUndo()) || (action.kind === "redo" && !canRedo());
       ctx.fillStyle = item === seqHover ? "#5a6a9a" : lit ? "#2f7d5b" : chainBar ? "#1b2444" : "#2a3558";
       ctx.fillRect(item.x, item.y, item.w, item.h);
-      ctx.fillStyle = "#ffffff";
+      ctx.fillStyle = unavailable ? "#66708f" : "#ffffff";
       ctx.font = "15px monospace";
       if (action.align === "left") {
         ctx.textAlign = "left";
@@ -2199,7 +2385,9 @@ function sequencePointerMove(item, source) {
 }
 
 function sequencePointerUp(source) {
-  if (seqDrag && seqDrag.source === source) seqDrag = null;
+  if (!seqDrag || seqDrag.source !== source) return;
+  seqDrag = null;
+  scheduleHistoryCommit(); // the whole sweep, as one undo step
 }
 
 function sequenceItemFromMouse(event) {
@@ -2276,15 +2464,17 @@ function toggleSequencePanel() {
   }
 }
 
-// A/B on the right controller, X/Y on the left: buttons 4 and 5 of the
-// "xr-standard" gamepad layout.
+// A (right hand) or X (left) calls the menu, B or Y undoes the last
+// change: buttons 4 and 5 of the "xr-standard" gamepad layout.
 const menuButtonWasDown = new WeakMap();
 function pollMenuButtons(session) {
   for (const source of session.inputSources) {
     const buttons = source.gamepad?.buttons;
     if (!buttons) continue;
-    const down = Boolean(buttons[4]?.pressed || buttons[5]?.pressed);
-    if (down && !menuButtonWasDown.get(source)) toggleSequencePanel();
+    const down = { menu: Boolean(buttons[4]?.pressed), undo: Boolean(buttons[5]?.pressed) };
+    const before = menuButtonWasDown.get(source) || {};
+    if (down.menu && !before.menu) toggleSequencePanel();
+    if (down.undo && !before.undo) undo();
     menuButtonWasDown.set(source, down);
   }
 }
@@ -2425,6 +2615,13 @@ window.vrPymolDebug = {
     }
     return Array.from(found);
   },
+  undo,
+  redo,
+  get history() {
+    commitHistory();
+    return { steps: history.length, at: historyIndex, canUndo: canUndo(), canRedo: canRedo() };
+  },
+  pollMenuButtons,
   saveGroup: () => saveGroup()?.name ?? null,
   recallGroup: (name) => recallGroup(groups.find((group) => group.name === name)),
   renameGroup: (name, to) => renameGroup(groups.find((group) => group.name === name), to),

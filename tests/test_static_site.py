@@ -276,6 +276,14 @@ def test_quest3_emulator_trigger_selects_and_a_button_toggles_sequence(static_si
         sticks = page.evaluate("() => vrPymolDebug.layerTriangles('sticks')")
         assert sticks["transparent"] == sticks["visible"] > 0
 
+        # B on the controller undoes the last change (the opacity).
+        assert not page.evaluate("() => vrPymolDebug.history.canRedo")
+        page.evaluate("() => __xrDevice.controllers.right.updateButtonValue('b-button', 1)")
+        page.wait_for_function("() => vrPymolDebug.history.canRedo", timeout=5000)
+        page.evaluate("() => __xrDevice.controllers.right.updateButtonValue('b-button', 0)")
+        assert page.evaluate("() => vrPymolDebug.layerTriangles('sticks').transparent") == 0
+        assert page.evaluate("() => vrPymolDebug.sequencePanel.visible")  # B is not the menu button
+
         # A hides the board, A again brings it back.
         for expected in (False, True):
             page.evaluate("() => __xrDevice.controllers.right.updateButtonValue('a-button', 1)")

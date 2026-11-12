@@ -84,7 +84,7 @@ def test_paint_and_see_through_act_on_the_selection(live_server):
         page.click("#invert-selection")
         before = page.evaluate(f"() => {D}.layerTriangles('cartoon')")
         assert before["transparent"] == 0
-        page.click("#opacity-buttons button[data-level='2']")
+        page.click("#opacity-buttons button[data-level='3']")  # 25%: barely there
         after = page.evaluate(f"() => {D}.layerTriangles('cartoon')")
         assert after["visible"] == before["visible"]  # nothing hidden, only restyled
         assert 0 < after["transparent"] < after["visible"]
@@ -99,7 +99,10 @@ def test_paint_and_see_through_act_on_the_selection(live_server):
                 return found;
             }}"""
         )
-        assert ghosts and all(opacity == 0.2 and not depth_write for opacity, depth_write in ghosts)
+        assert ghosts and all(opacity == 0.25 and not depth_write for opacity, depth_write in ghosts)
+        # the four settings, most solid first
+        labels = page.eval_on_selector_all("#opacity-buttons button", "els => els.map(e => e.textContent)")
+        assert labels == ["100%", "75%", "50%", "25%"]
         page.click("#opacity-buttons button[data-level='0']")
         assert page.evaluate(f"() => {D}.layerTriangles('cartoon')") == before
 

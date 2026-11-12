@@ -41,7 +41,9 @@
     #group-list button.active { outline: 2px solid #ff66cc; }
     #group-name { width: 60%; font-family: monospace; }
     #paint-swatches button { width: 20px; height: 20px; padding: 0; margin: 2px 2px 0 0; border: 1px solid #fff; cursor: pointer; }
-    #opacity-buttons button { width: 31%; margin-top: 2px; }
+    #opacity-buttons button { width: 23%; margin-top: 2px; padding: 1px 0; }
+    #undo, #redo { width: 48%; margin-bottom: 2px; }
+    #controls button:disabled { opacity: 0.4; }
     #toggle-sequence, #clear-selection, #select-all, #invert-selection { width: 100%; font-family: monospace; margin-top: 2px; }
     #sequence-popout {
       position: fixed; left: 8px; bottom: 64px; right: 250px; z-index: 1;
@@ -178,16 +180,19 @@
       <button id="delete-group" type="button">delete group</button>
     </section>
     <section>
-      <h4>colour and see-through &mdash; of the selection, or of everything</h4>
+      <h4>colour and opacity (100% solid, 25% see-through) &mdash; of the selection, or of everything</h4>
       <div id="paint-swatches"></div>
       <button id="paint-reset" type="button">reset colour</button>
       <div id="opacity-buttons">
-        <button type="button" data-level="0">solid</button>
-        <button type="button" data-level="1">50%</button>
-        <button type="button" data-level="2">80%</button>
+        <button type="button" data-level="0">100%</button>
+        <button type="button" data-level="1">75%</button>
+        <button type="button" data-level="2">50%</button>
+        <button type="button" data-level="3">25%</button>
       </div>
     </section>
     <section>
+      <button id="undo" type="button" disabled>undo</button>
+      <button id="redo" type="button" disabled>redo</button>
       <button id="reset-view" type="button">reset view</button>
     </section>
   </div>
