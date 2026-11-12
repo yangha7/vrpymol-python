@@ -1793,6 +1793,10 @@ function layoutSequenceWith(columns) {
   };
 }
 
+function repLabel(rep) {
+  return rep === "ball_and_stick" ? "ball+stick" : rep;
+}
+
 // The button rows, PyMOL's S/H/C menus flattened onto a board: show and
 // hide per representation and for H-bonds; selection helpers and the
 // pointer tool; colouring; see-through; named groups.
@@ -1815,12 +1819,12 @@ function menuButtons() {
   const repWidth = (right - left + SEQ_BUTTON_GAP) / slots - SEQ_BUTTON_GAP;
   rowLabel("show", SEQ_ROW_SHOW);
   place(left, SEQ_ROW_SHOW, repWidth, [
-    ...availableReps.map((rep) => ({ kind: "show", rep, label: rep })),
+    ...availableReps.map((rep) => ({ kind: "show", rep, label: repLabel(rep) })),
     { kind: "showHbonds", label: "h-bonds" },
   ]);
   rowLabel("hide", SEQ_ROW_HIDE);
   place(left, SEQ_ROW_HIDE, repWidth, [
-    ...availableReps.map((rep) => ({ kind: "hide", rep, label: rep })),
+    ...availableReps.map((rep) => ({ kind: "hide", rep, label: repLabel(rep) })),
     { kind: "hideHbonds", label: "h-bonds" },
     { kind: "hideAll", label: "everything" },
   ]);
@@ -1874,9 +1878,9 @@ function describeTarget() {
 function describeAction(action) {
   switch (action.kind) {
     case "show":
-      return `show ${describeTarget()} as ${action.rep}`;
+      return `show ${describeTarget()} as ${repLabel(action.rep)}`;
     case "hide":
-      return `hide ${action.rep} of ${describeTarget()}`;
+      return `hide ${repLabel(action.rep)} of ${describeTarget()}`;
     case "hideAll":
       return `hide ${describeTarget()} completely`;
     case "showHbonds":

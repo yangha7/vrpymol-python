@@ -166,3 +166,44 @@ def test_show_and_hide_by_selection(live_server):
         browser.close()
 
     assert not page_errors, f"uncaught JS errors: {page_errors}"
+
+
+def test_ball_and_stick_is_thin_sticks_plus_small_spheres(live_server):
+    """Ball and stick is PyMOL's sticks and spheres exported together at
+    fixed sizes, and those sizes must not leak into later plain exports."""
+    import os
+
+    from vr_pymol.wrl_parser import parse_wrl
+    from webxr import server
+
+    client = server.create_app().test_client()
+    wrl = os.path.join(server.SCENE_DIR, "scene.wrl")
+
+    def export(rep):
+        assert client.get(f"/api/layer?rep={rep}").status_code == 200
+        spheres, cylinders, _ = parse_wrl(wrl)
+        return ({round(s["radius"], 3) for s in spheres}, {round(c["radius"], 3) for c in cylinders})
+
+    client.get("/api/scene?molecule=1crn&export=0")
+    sphere_radii, stick_radii = export("ball_and_stick")
+    # PyMOL draws a double bond (the backbone C=O) as two sticks at 0.4x
+    assert stick_radii == {0.11, 0.044}
+    # a quarter of PyMOL's van der Waals radii: C 1.7, N 1.55, O 1.52, S 1.8
+    assert sphere_radii == {0.425, 0.388, 0.38, 0.45}
+    # plain sticks and spheres afterwards are back at PyMOL's own sizes
+    assert export("sticks") == (set(), {0.25, 0.1})
+    assert export("spheres") == ({1.7, 1.55, 1.52, 1.8}, set())
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page(viewport={"width": 1200, "height": 900}, ignore_https_errors=True)
+        page_errors = []
+        page.on("pageerror", lambda exc: page_errors.append(str(exc)))
+        page.goto(live_server, wait_until="networkidle")
+        page.wait_for_function("() => window.vrPymolDebug.sequence.length > 0", timeout=10000)
+        page.check("#rep-checkboxes input[value='ball_and_stick']")
+        _wait_ready(page, "ball_and_stick")
+        drawn = _triangles(page, "ball_and_stick")
+        assert drawn["visible"] == drawn["total"] > 0
+        browser.close()
+    assert not page_errors, f"uncaught JS errors: {page_errors}"

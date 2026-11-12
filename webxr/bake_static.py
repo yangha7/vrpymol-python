@@ -34,7 +34,7 @@ MOLECULES = ["1crn", "caffeine", "1mbn", "1bna", "4hhb", "1lyz", "1gfl", "1le0"]
 
 # One file per representation: the frontend loads each as its own layer and
 # mixes them per residue in the browser, so no combinations are baked.
-REPS = ["cartoon", "sticks", "spheres", "lines", "ribbon", "surface"]
+REPS = ["cartoon", "sticks", "ball_and_stick", "spheres", "lines", "ribbon", "surface"]
 
 COLORS = list(server._COLOR_SCHEMES)
 

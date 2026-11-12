@@ -175,7 +175,9 @@ def test_chains_fold_and_only_the_first_starts_open(live_server):
 
         def press(kind, key):
             # the pop-out scrolls: bring the button into view, then click
-            # where it now is on screen
+            # where it now is on screen (the canvas is resized on the next
+            # animation frame after a fold, so let that happen first)
+            page.wait_for_timeout(150)
             b = page.evaluate(f"() => {D}.menuButton('{kind}', '{key}')")
             page.evaluate(
                 f"""() => {{

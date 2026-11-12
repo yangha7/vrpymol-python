@@ -28,6 +28,7 @@ GLTF_PATH = os.path.join(SCENE_DIR, "scene.gltf")
 LAYER_REPS = (
     "cartoon",
     "sticks",
+    "ball_and_stick",
     "spheres",
     "lines",
     "ribbon",
@@ -37,6 +38,16 @@ LAYER_REPS = (
     "mesh",
     "dots",
 )
+
+# Ball and stick is not a PyMOL representation of its own: it is sticks and
+# spheres shown together, thin and small. Sizes match the DNA_Builder
+# viewer: stick radius in Angstroms, spheres as a fraction of each atom's
+# van der Waals radius.
+BALL_AND_STICK = "ball_and_stick"
+BALL_AND_STICK_SIZES = {"stick_radius": 0.11, "sphere_scale": 0.25}
+# PyMOL's own defaults, used when no size has been asked for -- set
+# explicitly on every export so one export's sizes never carry into the next.
+PYMOL_DEFAULT_SIZES = {"stick_radius": 0.25, "sphere_scale": 1.0}
 
 DEFAULT_MOLECULE = "1crn"
 DEFAULT_REP = "cartoon"
@@ -117,14 +128,21 @@ def _export_current_scene(session, settings):
     that it changes what a multi-state object (e.g. an NMR ensemble, many
     states/frames per one object) actually exports via `cmd.save`.
     """
-    if settings["stick_radius"] is not None:
-        session.cmd.set("stick_radius", settings["stick_radius"])
-    if settings["sphere_scale"] is not None:
-        session.cmd.set("sphere_scale", settings["sphere_scale"])
+    if settings["rep"] == BALL_AND_STICK:
+        reps = ["sticks", "spheres"]
+        sizes = BALL_AND_STICK_SIZES  # fixed: the size sliders are for plain sticks/spheres
+    else:
+        reps = settings["rep"].split("+")
+        sizes = {
+            name: default if settings[name] is None else settings[name]
+            for name, default in PYMOL_DEFAULT_SIZES.items()
+        }
+    for name, value in sizes.items():
+        session.cmd.set(name, value)
     session.cmd.set("cartoon_flat_sheets", int(settings["cartoon_flat_sheets"]))
     session.cmd.set("cartoon_smooth_loops", int(settings["cartoon_smooth_loops"]))
     session.cmd.hide("everything")
-    for one_rep in settings["rep"].split("+"):
+    for one_rep in reps:
         session.cmd.show(one_rep)
     _COLOR_SCHEMES[settings["color"]](session)
     if not settings["hydrogens"]:
