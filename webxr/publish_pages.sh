@@ -23,4 +23,8 @@ git init -q
 git checkout -q -b gh-pages
 git add -A
 git commit -q -m "Static site baked from $source_rev"
-git push -f "$remote" gh-pages
+# The site is several hundred MB in one commit. git's default 1 MB HTTP
+# buffer makes it stream that as a chunked upload, which GitHub tends to
+# drop partway ("RPC failed ... the remote end hung up"); a buffer larger
+# than the pack sends it as one ordinary request instead.
+git -c http.postBuffer=1048576000 -c http.version=HTTP/1.1 push -f "$remote" gh-pages

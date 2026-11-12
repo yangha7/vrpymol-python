@@ -50,9 +50,15 @@ def _direct_color_mapper(polydata):
 # 10x8 (~140 per sphere). Small molecules keep the smoother spheres, since
 # they're cheap and get viewed up close.
 LARGE_SPHERE_COUNT = 2000
+# Spheres this small (Angstroms) are the balls of ball-and-stick or dots,
+# not space-filling atoms: a facet on them is a fraction of a stick's width,
+# so 8x6 (~60 triangles) looks the same as 16x16 at an eighth of the size.
+SMALL_SPHERE_RADIUS = 0.8
 
 
-def _sphere_resolution(count):
+def _sphere_resolution(count, largest_radius):
+    if largest_radius <= SMALL_SPHERE_RADIUS:
+        return (8, 6)
     return (10, 8) if count > LARGE_SPHERE_COUNT else (16, 16)
 
 
@@ -78,7 +84,7 @@ def _sphere_actor(spheres):
 
     source = vtk.vtkSphereSource()
     source.SetRadius(1.0)
-    theta, phi = _sphere_resolution(len(spheres))
+    theta, phi = _sphere_resolution(len(spheres), max(s["radius"] for s in spheres))
     source.SetThetaResolution(theta)
     source.SetPhiResolution(phi)
 
