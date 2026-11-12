@@ -21,8 +21,11 @@ FARTHEST_DRAWN_TRIANGLE_JS = """([rep, atoms]) => {
     const toModel = model.matrixWorld.clone().invert();
     const a = new three.Vector3(), b = new three.Vector3(), c = new three.Vector3();
     let farthest = 0, triangles = 0;
-    model.getObjectByName(`layer-${rep}`).traverse((mesh) => {
-        if (!mesh.isMesh || !mesh.visible) return;
+    model.traverse((mesh) => {
+        // every layer of this representation (one per colouring scheme in use)
+        let layer = mesh;
+        while (layer && !layer.name.startsWith(`layer-${rep}-`)) layer = layer.parent;
+        if (!layer || !mesh.isMesh || !mesh.visible) return;
         const matrix = new three.Matrix4().multiplyMatrices(toModel, mesh.matrixWorld);
         const position = mesh.geometry.attributes.position;
         const index = mesh.geometry.index;

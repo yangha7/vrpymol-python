@@ -19,7 +19,7 @@ PyMOL's own OBJ/COLLADA export bakes spheres/cartoons into degenerate or bulky m
 ## Features
 
 - **Representations**: cartoon, sticks, spheres, lines, ribbon, nonbonded, nb_spheres, surface, mesh, dots — combinable like real PyMOL, and **per selection**: show sticks for the residues you selected while the rest stays cartoon, hide part of the cartoon, and so on. Each representation is loaded as its own layer and the browser draws only the selected residues' part of it, so mixing is instant and needs no re-export (cut ends of a cartoon or surface are therefore slightly ragged, not PyMOL's own end caps).
-- **Coloring**: default CPK, by chain, rainbow (N→C), by secondary structure, by B-factor — all real PyMOL commands (`util.cbc`, `util.chainbow`, `util.cbss`, `cmd.spectrum`) — plus a solid colour painted over the scheme for the selected residues.
+- **Coloring**: default CPK, by chain, rainbow (N→C), by secondary structure, by B-factor — all real PyMOL commands (`util.cbc`, `util.chainbow`, `util.cbss`, `cmd.spectrum`) — each applicable to the whole molecule or to just the selected residues (a few residues by element, the rest by chain), plus a solid colour painted over the scheme.
 - **See-through**: fade the selected residues to 50% or 80% transparent in every representation, so what lies behind them shows.
 - **Named groups**: save the selection under a name, recall it later, rename, delete — PyMOL's named selections. In the headset, rename uses the Meta Quest Browser's system keyboard.
 - **Cartoon detail**: flat/smooth sheets, smooth loops (real `cartoon_*` settings).

@@ -122,3 +122,22 @@ def test_cartoon_coloring_survives_export_to_gltf():
 
     rebuild_scene(molecule="4hhb", rep="cartoon", color="chain")
     assert len(_exported_vertex_colors()) == 4  # one colour per chain
+
+
+def test_default_colouring_comes_back_after_another_scheme():
+    # "default" used to mean "leave colours alone", so once any other scheme
+    # had been applied, asking for element colours again changed nothing.
+    def stick_colors(color):
+        _, cylinders, _ = _rebuild_and_parse(molecule="1crn", rep="sticks", color=color)
+        return {tuple(round(c, 2) for c in cyl["color"]) for cyl in cylinders}
+
+    from webxr import server
+
+    by_element = stick_colors("default")
+    assert len(by_element) == 4  # C, N, O, S
+    with server._lock:
+        session = server._get_session()
+        server._export_current_scene(session, {**server._display_settings, "color": "chain"})
+        assert len({tuple(round(c, 2) for c in cyl["color"]) for cyl in parse_wrl(WRL_PATH)[1]}) == 1
+        server._export_current_scene(session, {**server._display_settings, "color": "default"})
+        assert {tuple(round(c, 2) for c in cyl["color"]) for cyl in parse_wrl(WRL_PATH)[1]} == by_element

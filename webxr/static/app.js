@@ -115,7 +115,21 @@ function startNewModel(atoms) {
 
 let availableReps = []; // representations this build can draw, in menu order
 const shownByRep = new Map(); // rep -> Set of residue keys drawn in that rep
-const layers = new Map(); // rep -> {rep, state: "loading"|"ready"|"missing", root, parts}
+// Colouring scheme per residue: `baseScheme` for the whole scene, with
+// per-residue exceptions. A scheme's colours are PyMOL's, baked into the
+// layer file, so residues in different schemes are drawn from different
+// layers of the same representation -- hence a layer per (rep, scheme).
+let baseScheme = "default";
+const residueScheme = new Map(); // residue key -> scheme, where it differs from baseScheme
+const layers = new Map(); // "rep|scheme" -> {rep, scheme, state: "loading"|"ready"|"missing", root, parts}
+
+function schemeOfKey(key) {
+  return residueScheme.get(key) ?? baseScheme;
+}
+
+function layersOfRep(rep) {
+  return Array.from(layers.values()).filter((layer) => layer.rep === rep);
+}
 let staleLayers = []; // previous scene's layers, kept on screen until the new ones arrive
 let sceneRequestInFlight = false;
 // True from the moment a scene change (molecule, colouring, a setting) is
@@ -381,13 +395,14 @@ function paintPart(part, colorByOrdinal) {
   part.painted = Boolean(colorByOrdinal);
 }
 
-// Redraw one layer from the current state: which residues it is shown
-// for, which of them are see-through, and which are painted.
+// Redraw one layer from the current state: which residues it draws (shown
+// in its representation and coloured by its scheme), which of them are
+// see-through, and which are painted.
 function applyLayerMask(layer) {
   const mask = new Uint8Array(allResidues.length);
   for (const key of shownByRep.get(layer.rep)) {
     const residue = residueByKey.get(key);
-    if (residue) mask[residue.ordinal] = 1;
+    if (residue && schemeOfKey(key) === layer.scheme) mask[residue.ordinal] = 1;
   }
   const level = new Uint8Array(allResidues.length);
   for (const [key, value] of residueOpacity) {
@@ -432,12 +447,12 @@ function applyLayerMask(layer) {
   }
 }
 
-function layerUrl(rep) {
+function layerUrl(rep, scheme) {
   if (staticManifest) {
-    return staticManifest.files[`${sceneObjects.mol}|${rep}|${colorSelect.value}`] || null;
+    return staticManifest.files[`${sceneObjects.mol}|${rep}|${scheme}`] || null;
   }
   // cache-bust: the server re-exports on every request
-  return `/api/layer?rep=${encodeURIComponent(rep)}&t=${Date.now()}`;
+  return `/api/layer?rep=${encodeURIComponent(rep)}&color=${encodeURIComponent(scheme)}&t=${Date.now()}`;
 }
 
 function anyLayerLoading() {
@@ -467,17 +482,19 @@ function layerMissing(layer) {
   shownByRep.get(layer.rep).clear();
   hud.textContent = `${layer.rep}: nothing to draw for this molecule`;
   const nothingShown = availableReps.every((rep) => shownByRep.get(rep).size === 0);
-  if (nothingShown && availableReps.includes("sticks") && layers.get("sticks")?.state !== "missing") {
+  const sticksMissing = layersOfRep("sticks").some((other) => other.state === "missing");
+  if (nothingShown && availableReps.includes("sticks") && !sticksMissing) {
     allResidues.forEach((residue) => shownByRep.get("sticks").add(residue.key));
   }
   layerSettled();
   representationChanged();
 }
 
-function loadLayer(rep) {
-  const layer = { rep, state: "loading", root: null, parts: [] };
-  layers.set(rep, layer);
-  const url = layerUrl(rep);
+function loadLayer(rep, scheme) {
+  const key = `${rep}|${scheme}`;
+  const layer = { rep, scheme, state: "loading", root: null, parts: [] };
+  layers.set(key, layer);
+  const url = layerUrl(rep, scheme);
   if (!url) {
     layerMissing(layer);
     return;
@@ -488,9 +505,9 @@ function loadLayer(rep) {
     (gltf) => {
       // The scene moved on while this downloaded (baked files can be
       // several MB) -- don't let a stale layer into the new scene.
-      if (layers.get(rep) !== layer) return;
+      if (layers.get(key) !== layer) return;
       layer.root = gltf.scene;
-      layer.root.name = `layer-${rep}`;
+      layer.root.name = `layer-${rep}-${scheme}`;
       layer.parts = buildLayerParts(layer.root, rep);
       currentModel.add(layer.root);
       layer.state = "ready";
@@ -500,25 +517,56 @@ function loadLayer(rep) {
     },
     undefined,
     (error) => {
-      if (layers.get(rep) !== layer) return;
+      if (layers.get(key) !== layer) return;
       console.warn(`no ${rep} layer:`, error);
       layerMissing(layer);
     },
   );
 }
 
-// Bring what is drawn in line with `shownByRep`: fetch layers that are now
-// needed, and re-mask the ones already loaded.
+// Bring what is drawn in line with the state: fetch layers that are now
+// needed, re-mask the ones already loaded, retire the ones no residue uses.
 function ensureLayers() {
+  const needed = new Map(); // "rep|scheme" -> [rep, scheme]
   for (const rep of availableReps) {
-    const layer = layers.get(rep);
+    for (const key of shownByRep.get(rep)) {
+      const scheme = schemeOfKey(key);
+      needed.set(`${rep}|${scheme}`, [rep, scheme]);
+    }
+  }
+  for (const [key, layer] of layers) {
+    if (needed.has(key)) continue;
+    // kept on screen (with nothing left to draw, or its last look) until
+    // whatever replaces it has arrived, see layerSettled
+    if (layer.state === "ready") applyLayerMask(layer);
+    staleLayers.push(layer);
+    layers.delete(key);
+  }
+  for (const [key, [rep, scheme]] of needed) {
+    const layer = layers.get(key);
     if (!layer) {
-      if (shownByRep.get(rep).size > 0 && !sceneChangePending) loadLayer(rep);
+      if (!sceneChangePending) loadLayer(rep, scheme);
     } else if (layer.state === "ready") {
       applyLayerMask(layer);
     }
   }
   layerSettled();
+}
+
+// Colour by a scheme: the selection, or the whole scene when nothing is
+// selected (which also forgets every per-residue exception).
+function setScheme(scheme) {
+  if (selectedKeys.size === 0) {
+    baseScheme = scheme;
+    residueScheme.clear();
+  } else {
+    for (const key of selectedKeys) {
+      if (scheme === baseScheme) residueScheme.delete(key);
+      else residueScheme.set(key, scheme);
+    }
+  }
+  colorSelect.value = baseScheme;
+  representationChanged();
 }
 
 function representationChanged() {
@@ -1259,7 +1307,7 @@ function setSceneAtoms(atoms, objects) {
     return objects[objectName] !== sceneObjects[objectName] || !residueByKey.has(key);
   };
   const keySets = [selectedKeys, ...groups.map((group) => group.keys)];
-  for (const keys of [...keySets, residueColor, residueOpacity]) {
+  for (const keys of [...keySets, residueColor, residueOpacity, residueScheme]) {
     for (const key of Array.from(keys.keys())) {
       if (isStale(key)) keys.delete(key);
     }
@@ -1842,7 +1890,7 @@ function describeAction(action) {
     case "clearMeasurements":
       return "remove every measurement";
     case "scheme":
-      return `colour the whole molecule by ${action.label}`;
+      return `colour ${describeTarget()} by ${action.label}`;
     case "paint":
       return `colour ${describeTarget()} ${action.name}`;
     case "unpaint":
@@ -1896,8 +1944,7 @@ function runMenuAction(action) {
       clearMeasurements();
       break;
     case "scheme":
-      colorSelect.value = action.scheme;
-      scheduleApplySelection();
+      setScheme(action.scheme);
       break;
     case "paint":
       paintResidues(targetResidues(), action.hex);
@@ -2032,7 +2079,7 @@ function drawSequence() {
         (action.kind === "show" && target.some((r) => shownByRep.get(action.rep).has(r.key))) ||
         (action.kind === "showHbonds" && shownHbonds.size > 0) ||
         (action.kind === "tool" && action.tool === toolMode) ||
-        (action.kind === "scheme" && action.scheme === colorSelect.value) ||
+        (action.kind === "scheme" && target.some((r) => schemeOfKey(r.key) === action.scheme)) ||
         (action.kind === "opacity" &&
           action.level > 0 &&
           target.some((r) => residueOpacity.get(r.key) === action.level)) ||
@@ -2298,11 +2345,18 @@ window.vrPymolDebug = {
   showRep: (rep) => setRepShown(rep, targetResidues(), true),
   hideRep: (rep) => setRepShown(rep, targetResidues(), false),
   shownCount: (rep) => shownByRep.get(rep).size,
-  layerState: (rep) => layers.get(rep)?.state ?? "unloaded",
+  // state of a representation across the schemes it is drawn in
+  layerState(rep) {
+    const states = layersOfRep(rep).map((layer) => layer.state);
+    if (states.length === 0) return "unloaded";
+    return ["loading", "missing"].find((state) => states.includes(state)) ?? "ready";
+  },
+  setScheme,
+  schemeOf: (key) => schemeOfKey(key),
   // {total, visible, transparent} triangle counts of a loaded layer
   // (`visible` includes the see-through ones)
   layerTriangles(rep) {
-    const parts = layers.get(rep)?.parts ?? [];
+    const parts = layersOfRep(rep).flatMap((layer) => layer.parts);
     return {
       total: parts.reduce((sum, part) => sum + part.owner.length, 0),
       visible: parts.reduce((sum, part) => sum + part.visibleTriangles, 0),
@@ -2318,7 +2372,7 @@ window.vrPymolDebug = {
     const ordinal = residueByKey.get(key).ordinal;
     const found = new Set();
     const color = new THREE.Color();
-    for (const part of layers.get(rep)?.parts ?? []) {
+    for (const part of layers.get(`${rep}|${schemeOfKey(key)}`)?.parts ?? []) {
       const attribute = part.object.geometry.attributes.color;
       for (let v = 0; v < part.vertexOwner.length; v++) {
         if (part.vertexOwner[v] !== ordinal) continue;
@@ -2691,7 +2745,7 @@ async function applySelection() {
   const molecule = moleculeSelect.value;
   const hydrogens = showHydrogens.checked ? 1 : 0;
   const waters = showWaters.checked ? 1 : 0;
-  const color = colorSelect.value;
+  const color = baseScheme;
   const cartoonFlatSheetsVal = cartoonFlatSheets.checked ? 1 : 0;
   const cartoonSmoothLoopsVal = cartoonSmoothLoops.checked ? 1 : 0;
   const frame = frameSlider.value;
@@ -2764,7 +2818,10 @@ repCheckboxes.forEach((cb) => {
 });
 showHydrogens.addEventListener("change", scheduleApplySelection);
 showWaters.addEventListener("change", scheduleApplySelection);
-colorSelect.addEventListener("change", scheduleApplySelection);
+// The dropdown shows the scene's scheme. Picking from it colours the
+// selection if there is one (and then snaps back, since the scene's own
+// scheme hasn't changed), otherwise the whole scene.
+colorSelect.addEventListener("change", () => setScheme(colorSelect.value));
 // "change" (commits on release), not "input" (fires every drag pixel) --
 // rebuilding the scene re-exports the whole molecule server-side, too
 // expensive to do on every intermediate slider value.

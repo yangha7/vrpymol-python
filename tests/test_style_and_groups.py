@@ -62,6 +62,7 @@ def test_paint_and_see_through_act_on_the_selection(live_server):
         assert len(sticks) == 1 and _is_colour(sticks[0], "#ff3030"), sticks
 
         # the paint survives a change of colouring scheme underneath it
+        page.evaluate(f"() => {D}.clearSelection()")  # so the scheme goes on everything
         page.select_option("#color-select", "rainbow")
         page.wait_for_function(
             f"() => {D}.layerState('cartoon') === 'ready' && {D}.layerState('sticks') === 'ready'"
@@ -77,6 +78,7 @@ def test_paint_and_see_through_act_on_the_selection(live_server):
         page.click("#paint-reset")
         reset = page.evaluate(f"() => {D}.residueColors('cartoon', 'mol|A|10')")
         assert not any(_is_colour(c, "#ff3030") for c in reset)
+        _select_residue(page, atoms, "10")
 
         # --- see-through: the rest of the molecule, so ARG 10 shows through ---
         page.click("#invert-selection")
@@ -199,5 +201,63 @@ def test_chains_fold_and_only_the_first_starts_open(live_server):
         press("selectChain", "mol|C")
         assert len(page.evaluate(f"() => {D}.selectedKeys")) == lengths[2]
         assert page.inner_text("#selection-hud").startswith("chain C and resi 1-")
+        browser.close()
+    assert not errors, f"uncaught JS errors: {errors}"
+
+
+def test_colour_scheme_acts_on_the_selection(live_server):
+    """The reported case: a few residues by element, the rest by chain."""
+    with sync_playwright() as p:
+        browser, page, errors = _open(p, live_server)
+        atoms = page.evaluate("async () => (await (await fetch('/api/atoms')).json()).atoms")
+        page.evaluate(f"() => {{ {D}.hideRep('cartoon'); {D}.showRep('sticks'); }}")
+        page.wait_for_function(f"() => {D}.layerState('sticks') === 'ready'", timeout=10000)
+        # ARG 10 by element: its carbons, nitrogens and oxygen differ
+        by_element = sorted(page.evaluate(f"() => {D}.residueColors('sticks', 'mol|A|10')"))
+        assert len(by_element) == 3, by_element
+
+        # everything by chain: one chain, so one colour throughout
+        page.select_option("#color-select", "chain")
+        page.wait_for_function(
+            f"() => {D}.layerState('sticks') === 'ready' && {D}.residueColors('sticks', 'mol|A|10').length === 1",
+            timeout=10000,
+        )
+        chain_colour = page.evaluate(f"() => {D}.residueColors('sticks', 'mol|A|10')")
+        assert page.evaluate(f"() => {D}.residueColors('sticks', 'mol|A|30')") == chain_colour
+
+        # select ARG 10 and ARG 17, colour just them by element
+        _select_residue(page, atoms, "10")
+        _select_residue(page, atoms, "17")
+        page.select_option("#color-select", "default")
+        page.wait_for_function(
+            f"() => {D}.layerState('sticks') === 'ready' && {D}.residueColors('sticks', 'mol|A|10').length === 3",
+            timeout=10000,
+        )
+        for key in ("mol|A|10", "mol|A|17"):
+            assert sorted(page.evaluate(f"() => {D}.residueColors('sticks', '{key}')")) == by_element
+        assert page.evaluate(f"() => {D}.residueColors('sticks', 'mol|A|30')") == chain_colour
+        assert page.evaluate(f"() => {D}.schemeOf('mol|A|10')") == "default"
+        assert page.evaluate(f"() => {D}.schemeOf('mol|A|30')") == "chain"
+        # the dropdown keeps showing the scene's own scheme
+        assert page.input_value("#color-select") == "chain"
+        # nothing is drawn twice or dropped: both layers together are the whole molecule
+        sticks = page.evaluate(f"() => {D}.layerTriangles('sticks')")
+        assert 0 < sticks["visible"] < sticks["total"]
+
+        # the VR menu's scheme buttons call the same thing
+        page.evaluate(f"() => {D}.setScheme('rainbow')")
+        assert page.evaluate(f"() => {D}.schemeOf('mol|A|17')") == "rainbow"
+        assert page.evaluate(f"() => {D}.schemeOf('mol|A|30')") == "chain"
+
+        # with nothing selected a scheme goes on everything again
+        page.evaluate(f"() => {D}.clearSelection()")
+        page.select_option("#color-select", "default")
+        page.wait_for_function(
+            f"() => {D}.layerState('sticks') === 'ready' && {D}.residueColors('sticks', 'mol|A|30').length > 1",
+            timeout=10000,
+        )
+        assert page.evaluate(f"() => {D}.schemeOf('mol|A|17')") == "default"
+        after = page.evaluate(f"() => {D}.layerTriangles('sticks')")
+        assert after["visible"] == after["total"] > 0
         browser.close()
     assert not errors, f"uncaught JS errors: {errors}"

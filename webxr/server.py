@@ -47,10 +47,28 @@ DEFAULT_COLOR = "default"
 # by chain), `util.cbss` (by secondary structure: red helix/yellow sheet/
 # green loop), `util.chainbow` (real N-to-C rainbow spectrum), and
 # `cmd.spectrum("b", ...)` (by temperature factor) are all real, existing
-# commands -- "default" just skips recoloring, since `session.load` already
-# gives a fresh object in PyMOL's own default (CPK-like) atom colors.
+# commands. "default" puts back the colors PyMOL itself gave each atom when
+# the object was loaded (recorded then, see `_capture_default_colors`):
+# without that, "default" after any other scheme left the other scheme's
+# colors in place.
+def _restore_default_colors(session):
+    for name, colors in _default_colors.items():
+        remaining = iter(colors)
+        session.cmd.alter(name, "color = next(remaining)", space={"remaining": remaining, "next": next})
+    session.cmd.recolor()
+
+
+def _capture_default_colors(session, name):
+    """Record `name`'s per-atom PyMOL color indices, in atom order."""
+    colors = []
+    session.cmd.iterate(name, "colors.append(color)", space={"colors": colors})
+    _default_colors[name] = colors
+
+
+_default_colors = {}  # object name -> per-atom color indices as loaded
+
 _COLOR_SCHEMES = {
-    "default": None,
+    "default": _restore_default_colors,
     "chain": lambda session: util.cbc("all", _self=session.cmd),
     "rainbow": lambda session: util.chainbow("all", _self=session.cmd),
     "secondary-structure": lambda session: util.cbss("all", _self=session.cmd),
@@ -108,9 +126,7 @@ def _export_current_scene(session, settings):
     session.cmd.hide("everything")
     for one_rep in settings["rep"].split("+"):
         session.cmd.show(one_rep)
-    color_fn = _COLOR_SCHEMES[settings["color"]]
-    if color_fn is not None:
-        color_fn(session)
+    _COLOR_SCHEMES[settings["color"]](session)
     if not settings["hydrogens"]:
         session.cmd.hide("everything", "hydro")
     if not settings["waters"]:
@@ -189,6 +205,8 @@ def rebuild_scene(
         session.load(pdb_path)
         _objects.clear()
         _objects["mol"] = molecule
+        _default_colors.clear()
+        _capture_default_colors(session, "mol")
         _display_settings.update(settings)
         if export:
             _export_current_scene(session, _display_settings)
@@ -206,6 +224,7 @@ def add_object_to_scene(molecule):
         session = _get_session()
         name = session.add_object(pdb_path, base_name=molecule)
         _objects[name] = molecule
+        _capture_default_colors(session, name)
         max_states = _export_current_scene(session, _display_settings)
     return name, max_states
 
@@ -224,6 +243,7 @@ def remove_object_from_scene(name):
         session = _get_session()
         session.remove_object(name)
         del _objects[name]
+        _default_colors.pop(name, None)
         max_states = _export_current_scene(session, _display_settings)
     return max_states
 
@@ -343,16 +363,21 @@ def api_layer():
 
     The frontend draws each representation as its own layer and decides per
     residue which part of it is visible, so it asks for them one at a time,
-    under the current colouring and display settings. 404 when PyMOL draws
+    under the current display settings. `color` picks the colouring scheme
+    for this layer (default: the scene's), since different residues can be
+    coloured by different schemes. 404 when PyMOL draws
     nothing for this representation (cartoon of a small molecule, nonbonded
     of a structure with no waters or ions).
     """
     rep = request.args.get("rep")
     if rep not in LAYER_REPS:
         return jsonify({"ok": False, "error": f"unknown representation {rep!r}"}), 400
+    color = request.args.get("color", _display_settings["color"])
+    if color not in _COLOR_SCHEMES:
+        return jsonify({"ok": False, "error": f"unknown color scheme {color!r}"}), 400
     with _lock:
         session = _get_session()
-        _export_current_scene(session, {**_display_settings, "rep": rep})
+        _export_current_scene(session, {**_display_settings, "rep": rep, "color": color})
         if not has_geometry(GLTF_PATH):
             return jsonify({"ok": False, "error": f"nothing to draw as {rep}"}), 404
         with open(GLTF_PATH, "rb") as f:
