@@ -316,31 +316,119 @@ function buildLayerParts(root, rep) {
     // with drawRange, so toggling visibility never allocates GPU buffers.
     const index = new THREE.BufferAttribute(new source.constructor(source.length), 1);
     geometry.setIndex(index);
-    parts.push({ object, source, owner, index, visibleTriangles: 0 });
+    // For painting: which residue each vertex belongs to (a vertex shared
+    // across a residue boundary goes to whichever triangle claims it
+    // first), and the colours PyMOL gave it, to paint over and restore.
+    const vertexOwner = new Int32Array(position.count).fill(-1);
+    for (let t = 0; t < triangleCount; t++) {
+      for (let k = 0; k < 3; k++) {
+        const v = source[3 * t + k];
+        if (vertexOwner[v] < 0) vertexOwner[v] = owner[t];
+      }
+    }
+    const color = geometry.attributes.color;
+    parts.push({
+      object,
+      source,
+      owner,
+      index,
+      vertexOwner,
+      baseColors: color ? color.array.slice() : null,
+      painted: false,
+      ghosts: [], // see-through copies of the mesh, one per opacity level in use
+      visibleTriangles: 0,
+      transparentTriangles: 0,
+    });
   });
   return parts;
 }
 
+// A see-through copy of a mesh: the same vertex buffers, its own index
+// buffer and a transparent material. Triangles of see-through residues are
+// drawn by this copy and left out of the opaque original.
+function makeGhost(part, level) {
+  const geometry = new THREE.BufferGeometry();
+  for (const [name, attribute] of Object.entries(part.object.geometry.attributes)) {
+    geometry.setAttribute(name, attribute);
+  }
+  const index = new THREE.BufferAttribute(new part.source.constructor(part.source.length), 1);
+  geometry.setIndex(index);
+  const material = part.object.material.clone();
+  material.transparent = true;
+  material.opacity = OPACITY_LEVELS[level];
+  material.depthWrite = false; // or it would hide what is behind it after all
+  const mesh = new THREE.Mesh(geometry, material);
+  mesh.name = `${part.object.name}-seethrough-${level}`;
+  mesh.position.copy(part.object.position);
+  mesh.quaternion.copy(part.object.quaternion);
+  mesh.scale.copy(part.object.scale);
+  part.object.parent.add(mesh);
+  return { mesh, index };
+}
+
+function paintPart(part, colorByOrdinal) {
+  if (!part.baseColors || (!colorByOrdinal && !part.painted)) return;
+  const attribute = part.object.geometry.attributes.color;
+  attribute.array.set(part.baseColors);
+  if (colorByOrdinal) {
+    for (let v = 0; v < part.vertexOwner.length; v++) {
+      const color = colorByOrdinal[part.vertexOwner[v]];
+      // glTF vertex colours are linear, as are THREE.Color's components
+      if (color) attribute.setXYZ(v, color.r, color.g, color.b);
+    }
+  }
+  attribute.needsUpdate = true;
+  part.painted = Boolean(colorByOrdinal);
+}
+
+// Redraw one layer from the current state: which residues it is shown
+// for, which of them are see-through, and which are painted.
 function applyLayerMask(layer) {
   const mask = new Uint8Array(allResidues.length);
   for (const key of shownByRep.get(layer.rep)) {
     const residue = residueByKey.get(key);
     if (residue) mask[residue.ordinal] = 1;
   }
+  const level = new Uint8Array(allResidues.length);
+  for (const [key, value] of residueOpacity) {
+    const residue = residueByKey.get(key);
+    if (residue) level[residue.ordinal] = value;
+  }
+  let colorByOrdinal = null;
+  if (residueColor.size > 0) {
+    colorByOrdinal = new Array(allResidues.length);
+    for (const [key, color] of residueColor) {
+      const residue = residueByKey.get(key);
+      if (residue) colorByOrdinal[residue.ordinal] = color;
+    }
+  }
   for (const part of layer.parts) {
-    const out = part.index.array;
-    let n = 0;
+    // one output per opacity level: [opaque, ghost 1, ghost 2]
+    const outputs = [part.index, part.ghosts[1]?.index, part.ghosts[2]?.index];
+    const counts = [0, 0, 0];
     for (let t = 0; t < part.owner.length; t++) {
       const ordinal = part.owner[t];
       if (ordinal < 0 || !mask[ordinal]) continue;
-      out[n++] = part.source[3 * t];
-      out[n++] = part.source[3 * t + 1];
-      out[n++] = part.source[3 * t + 2];
+      const l = level[ordinal];
+      if (l > 0 && !outputs[l]) {
+        part.ghosts[l] = makeGhost(part, l);
+        outputs[l] = part.ghosts[l].index;
+      }
+      const out = outputs[l].array;
+      out[counts[l]++] = part.source[3 * t];
+      out[counts[l]++] = part.source[3 * t + 1];
+      out[counts[l]++] = part.source[3 * t + 2];
     }
-    part.index.needsUpdate = true;
-    part.object.geometry.setDrawRange(0, n);
-    part.object.visible = n > 0;
-    part.visibleTriangles = n / 3;
+    const meshes = [part.object, part.ghosts[1]?.mesh, part.ghosts[2]?.mesh];
+    meshes.forEach((mesh, l) => {
+      if (!mesh) return;
+      outputs[l].needsUpdate = true;
+      mesh.geometry.setDrawRange(0, counts[l]);
+      mesh.visible = counts[l] > 0;
+    });
+    part.visibleTriangles = (counts[0] + counts[1] + counts[2]) / 3;
+    part.transparentTriangles = (counts[1] + counts[2]) / 3;
+    paintPart(part, colorByOrdinal);
   }
 }
 
@@ -1100,7 +1188,8 @@ let sceneObjects = {}; // object name -> molecule id, to tell when a selection i
 let residueByKey = new Map(); // every residue, waters included
 let allResidues = []; // the same, as a list; residue.ordinal is its position here
 let sequenceResidues = []; // the ones shown in the sequence, in display order
-let sequenceChains = []; // [{object, chain, residues}]
+let sequenceChains = []; // [{key, object, chain, residues}]
+let expandedChains = new Set(); // keys of the chains whose sequence is unfolded in the menu
 const selectedKeys = new Set();
 let selectionMarkers = null; // THREE.InstancedMesh, child of currentModel
 
@@ -1134,7 +1223,7 @@ function buildResidues() {
       if (!WATER_NAMES.has(atom.resn)) {
         const chainKey = `${atom.object}|${atom.chain}`;
         if (!chains.has(chainKey)) {
-          chains.set(chainKey, { object: atom.object, chain: atom.chain, residues: [] });
+          chains.set(chainKey, { key: chainKey, object: atom.object, chain: atom.chain, residues: [] });
         }
         chains.get(chainKey).residues.push(residue);
       }
@@ -1169,9 +1258,16 @@ function setSceneAtoms(atoms, objects) {
     const objectName = key.split("|")[0];
     return objects[objectName] !== sceneObjects[objectName] || !residueByKey.has(key);
   };
-  for (const key of Array.from(selectedKeys)) {
-    if (isStale(key)) selectedKeys.delete(key);
+  const keySets = [selectedKeys, ...groups.map((group) => group.keys)];
+  for (const keys of [...keySets, residueColor, residueOpacity]) {
+    for (const key of Array.from(keys.keys())) {
+      if (isStale(key)) keys.delete(key);
+    }
   }
+  groups = groups.filter((group) => group.keys.size > 0);
+  if (!groups.includes(activeGroup)) activeGroup = null;
+  // Long chains would bury the menu, so only the first starts expanded.
+  if (objectsChanged) expandedChains = new Set(sequenceChains.slice(0, 1).map((chain) => chain.key));
   for (const rep of availableReps) {
     const keys = shownByRep.get(rep);
     for (const key of Array.from(keys)) {
@@ -1184,7 +1280,7 @@ function setSceneAtoms(atoms, objects) {
     allResidues.forEach((residue) => shownByRep.get(initial).add(residue.key));
   }
   sceneObjects = objects;
-  layoutSequence();
+  groupsChanged(); // also lays the menu out again
   selectionChanged();
 }
 
@@ -1354,6 +1450,185 @@ document.getElementById("select-all").addEventListener("click", () => {
 });
 document.getElementById("invert-selection").addEventListener("click", invertSelection);
 
+// --- per-residue colour and transparency ---
+//
+// Both are done in the browser on the loaded layers, like show/hide: a
+// colour is written over the vertex colours of the triangles a residue
+// owns, and see-through residues are drawn by a second, transparent copy
+// of the mesh that shares its vertices. The colouring scheme (by chain,
+// rainbow, ...) underneath is still PyMOL's, baked into the layer.
+
+const PAINT_COLORS = [
+  ["red", "#ff3030"],
+  ["orange", "#ff8c1a"],
+  ["yellow", "#ffe14d"],
+  ["green", "#33cc55"],
+  ["cyan", "#33cccc"],
+  ["blue", "#3366ff"],
+  ["magenta", "#cc44cc"],
+  ["white", "#f2f2f2"],
+  ["grey", "#808080"],
+];
+const COLOR_SCHEMES = [
+  ["default", "element"],
+  ["chain", "chain"],
+  ["rainbow", "rainbow"],
+  ["secondary-structure", "2nd struct"],
+  ["b-factor", "b-factor"],
+];
+// Index 0 is opaque; 1 and 2 are the two see-through settings.
+const OPACITY_LEVELS = [1, 0.5, 0.2];
+const OPACITY_LABELS = ["none", "50%", "80%"];
+
+const residueColor = new Map(); // residue key -> THREE.Color painted over the scheme
+const residueOpacity = new Map(); // residue key -> 1 or 2 (index into OPACITY_LEVELS)
+
+function restyleLayers() {
+  for (const layer of layers.values()) {
+    if (layer.state === "ready") applyLayerMask(layer);
+  }
+  requestSequenceRedraw();
+}
+
+// `hex` null removes the paint, giving the residues back their scheme colour.
+function paintResidues(residues, hex) {
+  for (const residue of residues) {
+    if (hex) residueColor.set(residue.key, new THREE.Color(hex));
+    else residueColor.delete(residue.key);
+  }
+  restyleLayers();
+}
+
+function setResidueOpacity(residues, level) {
+  for (const residue of residues) {
+    if (level > 0) residueOpacity.set(residue.key, level);
+    else residueOpacity.delete(residue.key);
+  }
+  restyleLayers();
+}
+
+// --- named groups of residues ---
+//
+// PyMOL's named selections: the current selection can be saved under a
+// name, recalled later (it becomes the selection again, so every button
+// acts on it), renamed and deleted. Names are restricted to what PyMOL
+// accepts for a selection name.
+
+const MAX_GROUPS = 8;
+const groupNameInput = document.getElementById("group-name");
+const groupList = document.getElementById("group-list");
+let groups = []; // [{name, keys: Set of residue keys}]
+let activeGroup = null; // the one rename and delete act on
+
+function groupsChanged() {
+  groupList.innerHTML = "";
+  for (const group of groups) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = `${group.name} (${group.keys.size})`;
+    button.className = group === activeGroup ? "active" : "";
+    button.addEventListener("click", () => recallGroup(group));
+    groupList.appendChild(button);
+  }
+  groupNameInput.value = activeGroup ? activeGroup.name : "";
+  groupNameInput.disabled = !activeGroup;
+  layoutSequence(); // the menu has one button per group
+}
+
+function saveGroup() {
+  if (selectedKeys.size === 0) {
+    hud.textContent = "nothing selected to save as a group";
+    return null;
+  }
+  if (groups.length >= MAX_GROUPS) {
+    hud.textContent = `at most ${MAX_GROUPS} groups -- delete one first`;
+    return null;
+  }
+  let n = 1;
+  while (groups.some((group) => group.name === `sele${n}`)) n += 1;
+  activeGroup = { name: `sele${n}`, keys: new Set(selectedKeys) };
+  groups.push(activeGroup);
+  groupsChanged();
+  return activeGroup;
+}
+
+function recallGroup(group) {
+  activeGroup = group;
+  selectedKeys.clear();
+  group.keys.forEach((key) => selectedKeys.add(key));
+  selectionChanged();
+  groupsChanged();
+}
+
+// Returns the name actually given, or null if it was refused.
+function renameGroup(group, requested) {
+  const name = requested.trim().replace(/[^A-Za-z0-9_]/g, "_").slice(0, 16);
+  if (!name || groups.some((other) => other !== group && other.name === name)) return null;
+  group.name = name;
+  groupsChanged();
+  return name;
+}
+
+function deleteGroup(group) {
+  groups = groups.filter((other) => other !== group);
+  if (activeGroup === group) activeGroup = null;
+  groupsChanged();
+}
+
+// Typing a name. On desktop the name box in the side panel is simply
+// edited. In the headset there is no keyboard of our own: focusing a text
+// input during an immersive session makes the Meta Quest Browser bring up
+// its system keyboard, and the typed text arrives in the input when the
+// keyboard is dismissed.
+function startRename() {
+  if (!activeGroup) {
+    hud.textContent = "save or pick a group first";
+    return;
+  }
+  const session = renderer.xr.getSession();
+  if (session && session.isSystemKeyboardSupported === false) {
+    hud.textContent = "this browser has no system keyboard in VR -- rename on the web page instead";
+  }
+  groupNameInput.value = activeGroup.name;
+  groupNameInput.focus();
+  groupNameInput.select();
+}
+
+function commitRename() {
+  if (!activeGroup || groupNameInput.value === activeGroup.name) return;
+  if (!renameGroup(activeGroup, groupNameInput.value)) {
+    hud.textContent = "that name is empty or already used";
+    groupNameInput.value = activeGroup.name;
+  }
+}
+
+groupNameInput.addEventListener("change", commitRename);
+groupNameInput.addEventListener("blur", commitRename);
+document.getElementById("save-group").addEventListener("click", saveGroup);
+document.getElementById("delete-group").addEventListener("click", () => {
+  if (activeGroup) deleteGroup(activeGroup);
+});
+
+// Side-panel versions of the colour and see-through buttons.
+const paintSwatches = document.getElementById("paint-swatches");
+for (const [name, hex] of PAINT_COLORS) {
+  const swatch = document.createElement("button");
+  swatch.type = "button";
+  swatch.title = name;
+  swatch.dataset.color = hex;
+  swatch.style.background = hex;
+  swatch.addEventListener("click", () => paintResidues(targetResidues(), hex));
+  paintSwatches.appendChild(swatch);
+}
+document.getElementById("paint-reset").addEventListener("click", () => {
+  paintResidues(targetResidues(), null);
+});
+document.querySelectorAll("#opacity-buttons button").forEach((button) => {
+  button.addEventListener("click", () => {
+    setResidueOpacity(targetResidues(), Number(button.dataset.level));
+  });
+});
+
 // --- menu window: show/hide buttons and the sequence ---
 //
 // One canvas, used twice: as an ordinary element in the desktop pop-out, and
@@ -1367,14 +1642,16 @@ const SEQ_PIXEL_RATIO = 2;
 const SEQ_MAX_HEIGHT = 1024;
 const SEQ_PAD = 14;
 const SEQ_ROW_SHOW = 76; // top of each button row
-const SEQ_ROW_HIDE = 114;
-const SEQ_ROW_SELECT = 152;
-const SEQ_ROW_TOOL = 190;
-const SEQ_ROW_HEIGHT = 32;
-const SEQ_ROW_LABEL = 70; // width of the "show"/"hide"/"select" labels
+const SEQ_ROW_HIDE = 112;
+const SEQ_ROW_SELECT = 148; // shared with the pointer tool
+const SEQ_ROW_COLOR = 184;
+const SEQ_ROW_OPACITY = 220;
+const SEQ_ROW_GROUPS = 256;
+const SEQ_ROW_HEIGHT = 30;
+const SEQ_ROW_LABEL = 70; // width of the row labels
 const SEQ_BUTTON_GAP = 6;
-const SEQ_HEADER = 242; // where the sequence starts
-const SEQ_GUTTER = 84;
+const SEQ_HEADER = 298; // where the sequence starts
+const SEQ_CHAIN_HEADER = 26; // height of a chain's fold/unfold bar
 // No scrolling in VR, so long sequences get more (smaller) letters per row
 // until the whole thing fits on one board.
 const SEQ_COLUMN_CHOICES = [40, 50, 60, 80, 100, 150];
@@ -1398,7 +1675,7 @@ seqPanel.name = "sequence-panel";
 seqPanel.visible = false;
 scene.add(seqPanel);
 
-let seqLayout = { height: SEQ_HEADER + SEQ_PAD, cellW: 0, cellH: 0, labels: [], ticks: [] };
+let seqLayout = { height: SEQ_HEADER + SEQ_PAD, cellW: 0, cellH: 0, rowLabels: [], ticks: [] };
 let seqItems = []; // hit targets: {x, y, w, h, residue} or {x, y, w, h, action: {kind, rep, label}}
 let seqHover = null;
 let seqDrag = null; // {source, add, lastIndex} while a sweep is in progress
@@ -1409,21 +1686,42 @@ function requestSequenceRedraw() {
 }
 
 function layoutSequenceWith(columns) {
-  const cellW = (SEQ_WIDTH - 2 * SEQ_PAD - SEQ_GUTTER) / columns;
+  const cellW = (SEQ_WIDTH - 2 * SEQ_PAD) / columns;
   const cellH = Math.min(34, Math.max(14, cellW * 1.5));
   const tickSize = Math.min(13, Math.max(9, cellW * 0.6));
   const multipleObjects = Object.keys(sceneObjects).length > 1;
-  const items = [];
-  const labels = [];
+  const menu = menuButtons();
+  const items = menu.items;
   const ticks = [];
-  const left = SEQ_PAD + SEQ_GUTTER;
   let y = SEQ_HEADER;
   for (const chain of sequenceChains) {
+    // Each chain has a bar that folds its sequence away or unfolds it, and
+    // a button that selects the whole chain.
+    const expanded = expandedChains.has(chain.key);
     const name = chain.chain || "-";
-    labels.push({
-      text: multipleObjects ? `${chain.object}:${name}` : `chain ${name}`,
-      y: y + tickSize + cellH / 2,
+    const title = multipleObjects ? `${chain.object}, chain ${name}` : `chain ${name}`;
+    const count = chain.residues.length;
+    items.push({
+      x: SEQ_PAD,
+      y,
+      w: SEQ_WIDTH - 2 * SEQ_PAD - 96 - SEQ_BUTTON_GAP,
+      h: SEQ_CHAIN_HEADER,
+      action: {
+        kind: "toggleChain",
+        chain,
+        label: `${expanded ? "-" : "+"} ${title}   ${count} residue${count === 1 ? "" : "s"}`,
+        align: "left",
+      },
     });
+    items.push({
+      x: SEQ_WIDTH - SEQ_PAD - 96,
+      y,
+      w: 96,
+      h: SEQ_CHAIN_HEADER,
+      action: { kind: "selectChain", chain, label: "select" },
+    });
+    y += SEQ_CHAIN_HEADER + 4;
+    if (!expanded) continue;
     let tickFreeFrom = 0;
     chain.residues.forEach((residue, i) => {
       const column = i % columns;
@@ -1431,7 +1729,7 @@ function layoutSequenceWith(columns) {
         y += tickSize + cellH + 4;
         tickFreeFrom = 0;
       }
-      const x = left + column * cellW;
+      const x = SEQ_PAD + column * cellW;
       const numbered = i === 0 || (/^-?\d+$/.test(residue.resi) && Number(residue.resi) % 10 === 0);
       if (numbered && x >= tickFreeFrom) {
         ticks.push({ text: residue.resi, x, y: y + tickSize - 2 });
@@ -1439,49 +1737,85 @@ function layoutSequenceWith(columns) {
       }
       items.push({ x, y: y + tickSize, w: cellW, h: cellH, residue });
     });
-    y += tickSize + cellH + 12;
+    y += tickSize + cellH + 10;
   }
-  items.push(...menuButtons());
-  return { layout: { height: y + SEQ_PAD, cellW, cellH, tickSize, labels, ticks }, items };
+  return {
+    layout: { height: y + SEQ_PAD, cellW, cellH, tickSize, rowLabels: menu.labels, ticks },
+    items,
+  };
 }
 
-// The button rows: show and hide per representation and for H-bonds
-// (PyMOL's S and H menus), the selection helpers, then the pointer tool.
+// The button rows, PyMOL's S/H/C menus flattened onto a board: show and
+// hide per representation and for H-bonds; selection helpers and the
+// pointer tool; colouring; see-through; named groups.
 function menuButtons() {
   const items = [];
+  const labels = [];
   const left = SEQ_PAD + SEQ_ROW_LABEL;
+  const right = SEQ_WIDTH - SEQ_PAD;
+  const rowLabel = (text, y, x = SEQ_PAD) => labels.push({ text, x, y: y + SEQ_ROW_HEIGHT / 2 + 1 });
+  // lay buttons out left to right from `x`, returning where the row got to
+  const place = (x, y, width, actions) => {
+    for (const action of actions) {
+      items.push({ x, y, w: width, h: SEQ_ROW_HEIGHT, action });
+      x += width + SEQ_BUTTON_GAP;
+    }
+    return x;
+  };
+
   const slots = availableReps.length + 2; // plus "h-bonds", and "everything" on the hide row
-  const width = (SEQ_WIDTH - SEQ_PAD - left + SEQ_BUTTON_GAP) / slots - SEQ_BUTTON_GAP;
-  const button = (slot, y, w, action) => ({
-    x: left + slot * (w + SEQ_BUTTON_GAP),
-    y,
-    w,
-    h: SEQ_ROW_HEIGHT,
-    action,
-  });
-  availableReps.forEach((rep, i) => {
-    items.push(button(i, SEQ_ROW_SHOW, width, { kind: "show", rep, label: rep }));
-    items.push(button(i, SEQ_ROW_HIDE, width, { kind: "hide", rep, label: rep }));
-  });
-  const n = availableReps.length;
-  items.push(button(n, SEQ_ROW_SHOW, width, { kind: "showHbonds", label: "h-bonds" }));
-  items.push(button(n, SEQ_ROW_HIDE, width, { kind: "hideHbonds", label: "h-bonds" }));
-  items.push(button(n + 1, SEQ_ROW_HIDE, width, { kind: "hideAll", label: "everything" }));
-  ["select", "distance", "angle", "dihedral"].forEach((tool, i) => {
-    items.push(button(i, SEQ_ROW_TOOL, 110, { kind: "tool", tool, label: tool }));
-  });
-  items.push({
-    x: left + 4 * (110 + SEQ_BUTTON_GAP) + 20,
-    y: SEQ_ROW_TOOL,
-    w: 230,
-    h: SEQ_ROW_HEIGHT,
-    action: { kind: "clearMeasurements", label: "clear measurements" },
-  });
-  ["selectAll", "invert", "clear"].forEach((kind, i) => {
-    const label = { selectAll: "all", invert: "invert", clear: "none" }[kind];
-    items.push(button(i, SEQ_ROW_SELECT, 110, { kind, label }));
-  });
-  return items;
+  const repWidth = (right - left + SEQ_BUTTON_GAP) / slots - SEQ_BUTTON_GAP;
+  rowLabel("show", SEQ_ROW_SHOW);
+  place(left, SEQ_ROW_SHOW, repWidth, [
+    ...availableReps.map((rep) => ({ kind: "show", rep, label: rep })),
+    { kind: "showHbonds", label: "h-bonds" },
+  ]);
+  rowLabel("hide", SEQ_ROW_HIDE);
+  place(left, SEQ_ROW_HIDE, repWidth, [
+    ...availableReps.map((rep) => ({ kind: "hide", rep, label: rep })),
+    { kind: "hideHbonds", label: "h-bonds" },
+    { kind: "hideAll", label: "everything" },
+  ]);
+
+  rowLabel("select", SEQ_ROW_SELECT);
+  let x = place(left, SEQ_ROW_SELECT, 76, [
+    { kind: "selectAll", label: "all" },
+    { kind: "invert", label: "invert" },
+    { kind: "clear", label: "none" },
+  ]);
+  rowLabel("tool", SEQ_ROW_SELECT, x + 14);
+  x = place(x + 60, SEQ_ROW_SELECT, 92, ["select", "distance", "angle", "dihedral"].map(
+    (tool) => ({ kind: "tool", tool, label: tool }),
+  ));
+  place(x + 8, SEQ_ROW_SELECT, right - x - 8, [{ kind: "clearMeasurements", label: "clear measurements" }]);
+
+  rowLabel("colour", SEQ_ROW_COLOR);
+  x = place(left, SEQ_ROW_COLOR, 92, COLOR_SCHEMES.map(
+    ([scheme, label]) => ({ kind: "scheme", scheme, label }),
+  ));
+  x = place(x + 14, SEQ_ROW_COLOR, 32, PAINT_COLORS.map(
+    ([name, hex]) => ({ kind: "paint", name, hex, label: "" }),
+  ));
+  place(x + 8, SEQ_ROW_COLOR, right - x - 8, [{ kind: "unpaint", label: "reset" }]);
+
+  rowLabel("fade", SEQ_ROW_OPACITY); // how see-through: none, 50% or 80%
+  place(left, SEQ_ROW_OPACITY, 76, OPACITY_LABELS.map(
+    (label, level) => ({ kind: "opacity", level, label }),
+  ));
+
+  rowLabel("groups", SEQ_ROW_GROUPS);
+  x = place(left, SEQ_ROW_GROUPS, 76, [
+    { kind: "saveGroup", label: "save" },
+    { kind: "renameGroup", label: "rename" },
+    { kind: "deleteGroup", label: "delete" },
+  ]);
+  if (groups.length > 0) {
+    const width = Math.min(130, (right - x - 14 + SEQ_BUTTON_GAP) / groups.length - SEQ_BUTTON_GAP);
+    place(x + 14, SEQ_ROW_GROUPS, width, groups.map(
+      (group) => ({ kind: "recallGroup", group, label: group.name }),
+    ));
+  }
+  return { items, labels };
 }
 
 function describeTarget() {
@@ -1507,6 +1841,28 @@ function describeAction(action) {
         : `trigger on the molecule picks ${TOOL_ATOM_COUNT[action.tool]} atoms to measure a ${action.tool}`;
     case "clearMeasurements":
       return "remove every measurement";
+    case "scheme":
+      return `colour the whole molecule by ${action.label}`;
+    case "paint":
+      return `colour ${describeTarget()} ${action.name}`;
+    case "unpaint":
+      return `give ${describeTarget()} back its scheme colour`;
+    case "opacity":
+      return action.level === 0
+        ? `make ${describeTarget()} solid`
+        : `make ${describeTarget()} ${action.label} see-through`;
+    case "saveGroup":
+      return "save the selection as a named group";
+    case "renameGroup":
+      return activeGroup ? `rename ${activeGroup.name}` : "rename a group (save or pick one first)";
+    case "deleteGroup":
+      return activeGroup ? `delete group ${activeGroup.name}` : "delete a group (pick one first)";
+    case "recallGroup":
+      return `select group ${action.group.name} (${action.group.keys.size} residues)`;
+    case "toggleChain":
+      return expandedChains.has(action.chain.key) ? "fold this chain's sequence away" : "unfold this chain's sequence";
+    case "selectChain":
+      return "select this whole chain (again to deselect)";
     case "selectAll":
       return "select every residue";
     case "invert":
@@ -1539,6 +1895,40 @@ function runMenuAction(action) {
     case "clearMeasurements":
       clearMeasurements();
       break;
+    case "scheme":
+      colorSelect.value = action.scheme;
+      scheduleApplySelection();
+      break;
+    case "paint":
+      paintResidues(targetResidues(), action.hex);
+      break;
+    case "unpaint":
+      paintResidues(targetResidues(), null);
+      break;
+    case "opacity":
+      setResidueOpacity(targetResidues(), action.level);
+      break;
+    case "saveGroup":
+      saveGroup();
+      break;
+    case "renameGroup":
+      startRename();
+      break;
+    case "deleteGroup":
+      if (activeGroup) deleteGroup(activeGroup);
+      break;
+    case "recallGroup":
+      recallGroup(action.group);
+      break;
+    case "toggleChain":
+      if (!expandedChains.delete(action.chain.key)) expandedChains.add(action.chain.key);
+      layoutSequence();
+      break;
+    case "selectChain": {
+      const residues = action.chain.residues;
+      setResiduesSelected(residues, !residues.every((residue) => selectedKeys.has(residue.key)));
+      break;
+    }
     case "selectAll":
       setResiduesSelected(allResidues, true);
       break;
@@ -1585,7 +1975,7 @@ function drawSequence() {
   ctx.textAlign = "left";
   ctx.fillStyle = "#ffffff";
   ctx.font = "bold 24px monospace";
-  ctx.fillText("Sequence", SEQ_PAD, 28);
+  ctx.fillText("Menu", SEQ_PAD, 28);
   ctx.font = "18px monospace";
   ctx.fillStyle = SEQ_SELECTED_COLOR;
   const count = selectedResidues().length;
@@ -1600,8 +1990,9 @@ function drawSequence() {
       : measureHud.textContent.trim() || `${toolMode}: pick ${TOOL_ATOM_COUNT[toolMode]} atoms`;
   }
   else if (sequenceResidues.length === 0) status = "no sequence loaded";
-  else status = `${count} residue${count === 1 ? "" : "s"} selected`;
-  ctx.fillText(status, SEQ_PAD + 150, 28, SEQ_WIDTH - 2 * SEQ_PAD - 150);
+  else if (count === 0) status = "nothing selected -- buttons act on the whole molecule";
+  else status = `${count} residue${count === 1 ? "" : "s"} selected -- buttons act on the selection`;
+  ctx.fillText(status, SEQ_PAD + 90, 28, SEQ_WIDTH - 2 * SEQ_PAD - 90);
   ctx.font = "14px monospace";
   ctx.fillStyle = "#9aa6cc";
   ctx.fillText(
@@ -1612,21 +2003,9 @@ function drawSequence() {
 
   ctx.font = "16px monospace";
   ctx.fillStyle = "#c8d0ee";
-  const rowMiddle = SEQ_ROW_HEIGHT / 2 + 1;
-  ctx.fillText("show", SEQ_PAD, SEQ_ROW_SHOW + rowMiddle);
-  ctx.fillText("hide", SEQ_PAD, SEQ_ROW_HIDE + rowMiddle);
-  ctx.fillText("select", SEQ_PAD, SEQ_ROW_SELECT + rowMiddle);
-  ctx.fillText("tool", SEQ_PAD, SEQ_ROW_TOOL + rowMiddle);
-  ctx.fillStyle = "#9aa6cc";
-  ctx.fillText(
-    `show and hide act on ${describeTarget()}`,
-    SEQ_PAD + SEQ_ROW_LABEL + 3 * (110 + SEQ_BUTTON_GAP) + 10,
-    SEQ_ROW_SELECT + rowMiddle,
-  );
+  for (const label of seqLayout.rowLabels) ctx.fillText(label.text, label.x, label.y);
   const target = targetResidues();
 
-  ctx.fillStyle = "#c8d0ee";
-  for (const label of seqLayout.labels) ctx.fillText(label.text, SEQ_PAD, label.y, SEQ_GUTTER - 8);
   ctx.font = `${seqLayout.tickSize}px monospace`;
   ctx.textBaseline = "alphabetic";
   ctx.fillStyle = "#8090b8";
@@ -1637,17 +2016,39 @@ function drawSequence() {
   const letterSize = Math.min(seqLayout.cellH * 0.75, seqLayout.cellW * 1.3);
   for (const item of seqItems) {
     if (item.action) {
-      // a "show" button is lit while any of the target is drawn that way
+      const action = item.action;
+      if (action.kind === "paint") {
+        ctx.fillStyle = action.hex;
+        ctx.fillRect(item.x, item.y, item.w, item.h);
+        if (item === seqHover) {
+          ctx.strokeStyle = "#ffffff";
+          ctx.lineWidth = 3;
+          ctx.strokeRect(item.x, item.y, item.w, item.h);
+        }
+        continue;
+      }
+      // lit: this is the current state of (some of) what the buttons act on
       const lit =
-        (item.action.kind === "show" &&
-          target.some((residue) => shownByRep.get(item.action.rep).has(residue.key))) ||
-        (item.action.kind === "showHbonds" && shownHbonds.size > 0) ||
-        (item.action.kind === "tool" && item.action.tool === toolMode);
-      ctx.fillStyle = item === seqHover ? "#5a6a9a" : lit ? "#2f7d5b" : "#2a3558";
+        (action.kind === "show" && target.some((r) => shownByRep.get(action.rep).has(r.key))) ||
+        (action.kind === "showHbonds" && shownHbonds.size > 0) ||
+        (action.kind === "tool" && action.tool === toolMode) ||
+        (action.kind === "scheme" && action.scheme === colorSelect.value) ||
+        (action.kind === "opacity" &&
+          action.level > 0 &&
+          target.some((r) => residueOpacity.get(r.key) === action.level)) ||
+        (action.kind === "recallGroup" && action.group === activeGroup);
+      const chainBar = action.kind === "toggleChain";
+      ctx.fillStyle = item === seqHover ? "#5a6a9a" : lit ? "#2f7d5b" : chainBar ? "#1b2444" : "#2a3558";
       ctx.fillRect(item.x, item.y, item.w, item.h);
       ctx.fillStyle = "#ffffff";
       ctx.font = "15px monospace";
-      ctx.fillText(item.action.label, item.x + item.w / 2, item.y + item.h / 2 + 1, item.w - 6);
+      if (action.align === "left") {
+        ctx.textAlign = "left";
+        ctx.fillText(action.label, item.x + 8, item.y + item.h / 2 + 1, item.w - 16);
+        ctx.textAlign = "center";
+      } else {
+        ctx.fillText(action.label, item.x + item.w / 2, item.y + item.h / 2 + 1, item.w - 6);
+      }
       continue;
     }
     const selected = selectedKeys.has(item.residue.key);
@@ -1898,18 +2299,60 @@ window.vrPymolDebug = {
   hideRep: (rep) => setRepShown(rep, targetResidues(), false),
   shownCount: (rep) => shownByRep.get(rep).size,
   layerState: (rep) => layers.get(rep)?.state ?? "unloaded",
-  // {total, visible} triangle counts of a loaded layer
+  // {total, visible, transparent} triangle counts of a loaded layer
+  // (`visible` includes the see-through ones)
   layerTriangles(rep) {
     const parts = layers.get(rep)?.parts ?? [];
     return {
       total: parts.reduce((sum, part) => sum + part.owner.length, 0),
       visible: parts.reduce((sum, part) => sum + part.visibleTriangles, 0),
+      transparent: parts.reduce((sum, part) => sum + part.transparentTriangles, 0),
     };
+  },
+  // paint / see-through / groups, on the selection (or everything), as the
+  // menu buttons do
+  paint: (hex) => paintResidues(targetResidues(), hex),
+  setOpacity: (level) => setResidueOpacity(targetResidues(), level),
+  // distinct colours ("#rrggbb", as displayed) of a residue's vertices in a layer
+  residueColors(rep, key) {
+    const ordinal = residueByKey.get(key).ordinal;
+    const found = new Set();
+    const color = new THREE.Color();
+    for (const part of layers.get(rep)?.parts ?? []) {
+      const attribute = part.object.geometry.attributes.color;
+      for (let v = 0; v < part.vertexOwner.length; v++) {
+        if (part.vertexOwner[v] !== ordinal) continue;
+        color.setRGB(attribute.getX(v), attribute.getY(v), attribute.getZ(v));
+        found.add(`#${color.getHexString()}`);
+      }
+    }
+    return Array.from(found);
+  },
+  saveGroup: () => saveGroup()?.name ?? null,
+  recallGroup: (name) => recallGroup(groups.find((group) => group.name === name)),
+  renameGroup: (name, to) => renameGroup(groups.find((group) => group.name === name), to),
+  deleteGroup: (name) => deleteGroup(groups.find((group) => group.name === name)),
+  startRename,
+  get groups() {
+    return groups.map((group) => ({
+      name: group.name,
+      size: group.keys.size,
+      active: group === activeGroup,
+    }));
+  },
+  get expandedChains() {
+    return Array.from(expandedChains);
+  },
+  get menuHeight() {
+    return seqLayout.height;
   },
   // where a menu button is drawn, in the same form as sequenceCell
   menuButton(kind, rep) {
     const item = seqItems.find(
-      (it) => it.action && it.action.kind === kind && (it.action.rep ?? it.action.tool) === rep,
+      (it) =>
+        it.action &&
+        it.action.kind === kind &&
+        (it.action.rep ?? it.action.tool ?? it.action.chain?.key ?? it.action.group?.name) === rep,
     );
     const u = (item.x + item.w / 2) / SEQ_WIDTH;
     const v = (item.y + item.h / 2) / seqLayout.height;

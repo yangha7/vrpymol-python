@@ -265,6 +265,17 @@ def test_quest3_emulator_trigger_selects_and_a_button_toggles_sequence(static_si
         assert hbonds["pairs"] == 37  # crambin, see test_measure_and_hbonds.py
         assert 0 < hbonds["shown"] < 37 and hbonds["dashes"] >= hbonds["shown"], hbonds
 
+        # Paint and see-through restyle the baked layers in the page too
+        # (their vertex colours are 8-bit, unlike the live server's export).
+        key = page.evaluate("() => vrPymolDebug.selectedKeys[0]")
+        page.evaluate("() => { vrPymolDebug.paint('#3366ff'); vrPymolDebug.setOpacity(1); }")
+        colours = page.evaluate(f"() => vrPymolDebug.residueColors('sticks', {key!r})")
+        assert len(colours) == 1, colours
+        red, green, blue = (int(colours[0][i:i + 2], 16) for i in (1, 3, 5))
+        assert abs(red - 0x33) <= 4 and abs(green - 0x66) <= 4 and abs(blue - 0xFF) <= 4, colours
+        sticks = page.evaluate("() => vrPymolDebug.layerTriangles('sticks')")
+        assert sticks["transparent"] == sticks["visible"] > 0
+
         # A hides the board, A again brings it back.
         for expected in (False, True):
             page.evaluate("() => __xrDevice.controllers.right.updateButtonValue('a-button', 1)")
