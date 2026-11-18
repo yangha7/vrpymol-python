@@ -206,3 +206,76 @@ def test_exported_geometry_is_in_the_atom_table_frame(client, tmp_path):
     distances = np.linalg.norm(atoms[:, None, :] - centres[None, :, :], axis=2)
     assert distances.min(axis=1).max() < 2e-3
     assert len(set(distances.argmin(axis=1))) == 327  # one sphere per atom
+
+
+def test_hands_are_ignored_until_a_controller_is_back(live_server):
+    """Hand tracking is off: a hand must not select, press menu buttons or
+    grab, its ray is hidden, and the menu says why."""
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page(viewport={"width": 1200, "height": 800}, ignore_https_errors=True)
+        page_errors = []
+        page.on("pageerror", lambda exc: page_errors.append(str(exc)))
+        page.goto(live_server, wait_until="networkidle")
+        page.evaluate("() => window.vrPymolApplySelection()")
+        page.wait_for_function("() => window.vrPymolDebug.sequence.join('').length === 46", timeout=10000)
+        page.wait_for_function("() => document.getElementById('hud').textContent.startsWith('loaded')", timeout=10000)
+        page.evaluate("async () => { window.__three_for_tests__ = await import('three'); }")
+        page.evaluate("() => window.vrPymolDebug.clearSelection()")
+        atoms = page.evaluate("async () => (await (await fetch('/api/atoms')).json()).atoms")
+
+        def connect(index, source):
+            # what three.js dispatches when the headset reports an input source
+            page.evaluate(
+                f"""() => window.vrPymolDebug.controllers[{index}].dispatchEvent(
+                    {{ type: "connected", data: {source} }})"""
+            )
+
+        def ray_visible(index):
+            return page.evaluate(
+                f"() => window.vrPymolDebug.controllers[{index}].getObjectByName('controller-ray').visible"
+            )
+
+        def aim_at_molecule(index):
+            ax, ay, az = next(a["coord"] for a in atoms if a["resi"] == "10")
+            cx, cy, cz = page.evaluate(
+                f"""() => window.vrPymolDebug.model.localToWorld(
+                    new window.__three_for_tests__.Vector3({ax}, {ay}, {az})).toArray()"""
+            )
+            _move_controller(page, index, cx, cy, cz + 1)
+
+        hand = '{ hand: {}, profiles: ["generic-hand-select", "generic-hand"], handedness: "right" }'
+        touch = '{ hand: null, profiles: ["meta-quest-touch-plus", "generic-trigger-squeeze-thumbstick"], handedness: "right" }'
+
+        # --- as a hand: nothing responds ---
+        connect(0, hand)
+        assert not ray_visible(0)
+        page.evaluate("() => window.vrPymolDebug.toggleSequencePanel()")
+        _aim_controller_at_cell(page, 0, 20)
+        page.evaluate("() => window.vrPymolDebug.onTriggerStart(0)")
+        page.evaluate("() => window.vrPymolDebug.onTriggerEnd(0)")
+        assert page.evaluate("() => window.vrPymolDebug.selectedKeys") == []
+        page.evaluate("() => window.vrPymolDebug.toggleSequencePanel()")
+        aim_at_molecule(0)
+        page.evaluate("() => window.vrPymolDebug.onTriggerStart(0)")
+        page.evaluate("() => window.vrPymolDebug.onGrabStart(0)")
+        assert page.evaluate("() => window.vrPymolDebug.selectedKeys") == []
+        assert page.evaluate("() => window.vrPymolDebug.grabbers") == []
+
+        # --- the same slot as a controller: both work again ---
+        connect(0, touch)
+        assert ray_visible(0)
+        page.evaluate("() => window.vrPymolDebug.onTriggerStart(0)")
+        page.evaluate("() => window.vrPymolDebug.onTriggerEnd(0)")
+        assert len(page.evaluate("() => window.vrPymolDebug.selectedKeys")) == 1
+        page.evaluate("() => window.vrPymolDebug.onGrabStart(0)")
+        assert page.evaluate("() => window.vrPymolDebug.grabbers") == [0]
+
+        # --- swapping to a hand mid-grab lets go of the molecule ---
+        connect(0, hand)
+        assert page.evaluate("() => window.vrPymolDebug.grabbers") == []
+        assert page.evaluate(
+            "() => window.vrPymolDebug.model.parent === window.vrPymolDebug.scene"
+        ), "the molecule must not stay attached to a hand"
+        browser.close()
+    assert not page_errors, f"uncaught JS errors: {page_errors}"

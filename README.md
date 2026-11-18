@@ -64,6 +64,8 @@ Every menu action applies to the **selected residues**, or to the **whole molecu
 | A (right hand) or X (left hand) | Show or hide the menu |
 | B (right hand) or Y (left hand) | Undo the last change |
 
+Hand tracking is not supported. With the controllers put down, the headset would offer each hand as a pointer whose pinch acts as the trigger, but a hand has no grip, thumbstick or buttons, so only part of the viewer would respond. Hands are therefore ignored, their rays are hidden, and the menu asks for the controllers.
+
 ### Menu
 
 The menu is a board that floats below the molecule in VR and is a pop-out panel on desktop ("show menu and sequence").
@@ -193,7 +195,7 @@ python -m pytest -q
 Expected output, with a run time of about 2 min on the development machine:
 
 ```
-93 passed in 114.69s (0:01:54)
+94 passed in 121.89s (0:02:01)
 ```
 
 The tests use pymol-open-source itself, without mocks, and drive the page in headless Chromium through Playwright. VR input is exercised in two ways: by calling the page's controller handlers directly, and, in `tests/test_static_site.py`, through Meta's Immersive Web Emulation Runtime, which presents an emulated Quest 3 to the page. That test downloads the emulator from esm.sh and therefore needs network access.

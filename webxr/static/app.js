@@ -802,20 +802,52 @@ function buildControllerRay() {
   return line;
 }
 
+// Hand tracking is switched off. With the controllers put down, the headset
+// offers each hand as a pointer whose pinch arrives as a trigger press, so
+// without this the trigger actions would half-work with bare hands while
+// grab, zoom, undo and the menu button -- which need a grip, a thumbstick
+// and A/B -- would not. A hand is ignored entirely and its ray is hidden,
+// and the menu says to pick up the controllers.
+function isHandSource(source) {
+  return Boolean(source?.hand) || Array.from(source?.profiles || []).some((p) => p.includes("hand"));
+}
+
+function anyHandConnected() {
+  return controllers.some((controller) => controller.userData.isHand);
+}
+
 const controllers = [renderer.xr.getController(0), renderer.xr.getController(1)];
 controllers.forEach((controller) => {
   controller.add(buildControllerRay());
   controller.addEventListener("squeezestart", onGrabStart);
   controller.addEventListener("squeezeend", onGrabEnd);
+  // three.js reports what is driving each slot: a controller or a hand
+  controller.addEventListener("connected", (event) => {
+    controller.userData.isHand = isHandSource(event.data);
+    controller.getObjectByName("controller-ray").visible = !controller.userData.isHand;
+    if (controller.userData.isHand) releaseController(controller);
+    requestSequenceRedraw();
+  });
+  controller.addEventListener("disconnected", () => {
+    controller.userData.isHand = false;
+    controller.getObjectByName("controller-ray").visible = true;
+    requestSequenceRedraw();
+  });
   scene.add(controller);
 });
+
+// Let go of anything a slot was doing when its controller is swapped for a hand.
+function releaseController(controller) {
+  onGrabEnd({ target: controller });
+  sequencePointerUp(controller);
+}
 
 const raycaster = new THREE.Raycaster();
 const grabbers = []; // controllers currently grabbing currentModel, in grab order
 let twoHand = null; // {startDistance, startScale, startMidpoint, startPosition, startAngle, startQuaternion}
 
 function controllerModelHit(controller) {
-  if (!currentModel) return null;
+  if (!currentModel || controller.userData.isHand) return null;
   raycaster.ray.origin.setFromMatrixPosition(controller.matrixWorld);
   raycaster.ray.direction.set(0, 0, -1).transformDirection(controller.matrixWorld);
   return raycaster.intersectObject(currentModel, true)[0] || null;
@@ -931,7 +963,7 @@ function thumbstickY(session) {
   let y = 0;
   for (const source of session.inputSources) {
     const axes = source.gamepad?.axes;
-    if (!axes || axes.length < 2) continue;
+    if (!axes || axes.length < 2 || isHandSource(source)) continue;
     // "xr-standard" layout: axes 0/1 are the touchpad, 2/3 the thumbstick.
     const value = axes.length >= 4 ? axes[3] : axes[1];
     if (Math.abs(value) > Math.abs(y)) y = value;
@@ -1199,6 +1231,7 @@ function atomOnRay(origin, direction) {
 }
 
 function atomUnderController(controller) {
+  if (controller.userData.isHand) return null;
   const origin = new THREE.Vector3().setFromMatrixPosition(controller.matrixWorld);
   const direction = new THREE.Vector3(0, 0, -1).transformDirection(controller.matrixWorld);
   return atomOnRay(origin, direction);
@@ -2403,11 +2436,16 @@ function drawSequence() {
   ctx.fillText(status, SEQ_PAD + 90, 28, SEQ_WIDTH - 2 * SEQ_PAD - 90 - 170); // clear of undo/redo
   ctx.font = "14px monospace";
   ctx.fillStyle = "#9aa6cc";
-  ctx.fillText(
-    "trigger: use the tool on the molecule, press a button or residue here | grip: grab | stick: zoom | A: menu | B: undo",
-    SEQ_PAD,
-    56,
-  );
+  if (anyHandConnected()) {
+    ctx.fillStyle = "#ffcc66";
+    ctx.fillText("Hand tracking is not supported -- pick up the controllers to point, select and grab.", SEQ_PAD, 56);
+  } else {
+    ctx.fillText(
+      "trigger: use the tool on the molecule, press a button or residue here | grip: grab | stick: zoom | A: menu | B: undo",
+      SEQ_PAD,
+      56,
+    );
+  }
 
   ctx.font = "16px monospace";
   ctx.fillStyle = "#c8d0ee";
@@ -2552,7 +2590,7 @@ toggleSequenceButton.addEventListener("click", () => {
 // the board is hidden), `null` on the board but between targets, else the
 // residue cell or button under it.
 function panelItemAt(controller) {
-  if (!seqPanel.visible) return undefined;
+  if (!seqPanel.visible || controller.userData.isHand) return undefined;
   raycaster.ray.origin.setFromMatrixPosition(controller.matrixWorld);
   raycaster.ray.direction.set(0, 0, -1).transformDirection(controller.matrixWorld);
   const hit = raycaster.intersectObject(seqPanel, false)[0];
@@ -2603,7 +2641,7 @@ const menuButtonWasDown = new WeakMap();
 function pollMenuButtons(session) {
   for (const source of session.inputSources) {
     const buttons = source.gamepad?.buttons;
-    if (!buttons) continue;
+    if (!buttons || isHandSource(source)) continue;
     const down = { menu: Boolean(buttons[4]?.pressed), undo: Boolean(buttons[5]?.pressed) };
     const before = menuButtonWasDown.get(source) || {};
     if (down.menu && !before.menu) toggleSequencePanel();
